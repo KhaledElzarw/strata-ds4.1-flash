@@ -6490,6 +6490,16 @@ struct Model::Impl {
             if (kt.first.find(".ffn.experts.") != std::string::npos && kt.first.rfind("mtp.", 0) != 0) b += (double) kt.second.bytes;
         return std::max(48.0, b / 1e9);
     }
+    // what the auto store leaves free for the system and the owner's programs: DS4_STORE_HEADROOM_GB, 12 by default (at least 2;
+    // one 3090 + 128 GB at 256K context: 6 left 11.6 GB free at the lowest and decoded real agent turns 3.5% faster, ds4/lab/RESULTS.md)
+    static double store_headroom_gb() {
+        static const double h = [] {
+            const char* v = std::getenv("DS4_STORE_HEADROOM_GB");
+            const double x = v ? std::atof(v) : 12.0;
+            return x >= 2.0 ? x : 12.0;
+        }();
+        return h;
+    }
     double store_gb() const {
         static double cached = -2.0;   // (decided once: the layout of the blobs depends on it)
         if (cached > -1.5) return cached;
@@ -6499,10 +6509,10 @@ struct Model::Impl {
         else if (gb < 0.0 && cpu_lane_fits_ram()) {   // auto, and the RAM holds every CPU-lane expert beside kRamMargin: they are copied in at load
             auto_copy_all = true;                       // (copy_experts), the demand store would only be a second, smaller copy of them
             gb = 0.0;
-        } else if (gb < 0.0) {   // auto: the RAM free now less 12 GB for the system and the owner's programs, all the experts at most
+        } else if (gb < 0.0) {   // auto: the RAM free now less the headroom (12 GB) for the system and the owner's programs, all the experts at most
             const uint64_t avail = ram_avail();
             avail0_ = avail;
-            const double room = avail == ~uint64_t{0} ? 0.0 : (double) avail / 1e9 - 12.0;
+            const double room = avail == ~uint64_t{0} ? 0.0 : (double) avail / 1e9 - store_headroom_gb();
             gb = room >= 4.0 ? std::min(store_cap_gb(), room) : 0.0;
         }
         return cached = gb;
@@ -6526,7 +6536,7 @@ struct Model::Impl {
         }
         const bool uma = strata::ds4::store_gpu_shares_ram(any_integrated, avail0_, avail);
         const double ctx_gb = uma ? 1.1e-4 * std::max(0.0, (double) o.max_context - 16384.0) : 0.0;
-        const double room = (double) avail / 1e9 - 12.0 - ctx_gb;
+        const double room = (double) avail / 1e9 - store_headroom_gb() - ctx_gb;
         const double now = room >= 4.0 ? std::min(store_cap_gb(), room) : 0.0;
         if (now < gb)
             std::fprintf(stderr, "ds4: RAM store: %.1f GB of RAM free after the GPU's weights: store sized %.1f GB, not %.1f\n",

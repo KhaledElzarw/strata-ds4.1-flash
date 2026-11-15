@@ -117,6 +117,50 @@ the whole 100K prefix (99,999 tokens kept), so its prompt figure is not a read s
 context shows the split still runs there (it falls back to the scalar kernel above its row cap).  Adopted: `launch-ds4.ps1` sets DS4_ATTN_SPLIT=1 (a shell
 DS4_ATTN_SPLIT=0 still turns it off); checked by starting the server through it and reading the engine's environment.
 
+## Where a token goes now (tp.sh, 2026-11-15 19:38-19:42)
+
+Build 8de3bc34 (iq1s rows + split attention), `--max-context 262144`, frozen profile, one 38-token prompt then greedy
+decode in CLI mode (it ended at 270-295 tokens: the store is still warming, so these runs are slower than a long
+conversation's).  DS4_PROF (GPU stage time a token): 46.5 ms with the split, 45.1 without; attention 10.60 vs 11.07 ms,
+waiting for the CPU lane 27.4 vs 25.5 (the lane varies more than the split saves at this length).
+
+The DS4_DIAG build's host timers over 270 tokens (cpu_experts_iq phases, ms a token): gate+up 13.5, down 7.6, activation
+quantize 0.64 + 0.38, prefetch hints 0.04 = 22.2 ms, of which the RAM store's SSD reads are 8.8 ms a token (3.9 of the
+lane's 85 experts a token miss the store: it holds 9,513 of the 13,301 lane experts at 256K, 82.8 GB, sized as free RAM
+minus 12 GB).  DS4_TLOG2's host spans around the expert stage are 0.01-0.03 ms (the host only queues there).
+
+Nsight Systems, 200 tokens (tokens 21-200 measured, 46.97 ms a token under the tracer):
+
+| | a token |
+|---|---|
+| kernels | 1,511 launches, one stream; GPU busy 42.65 ms (91%), idle 4.32 ms |
+| idle gaps | 1,443 under 5 us (2.47 ms), 44 of 5-20 us (0.39), 22 of 20-100 us (0.81), 2 of 0.1-1 ms (0.62) |
+| wait_seq_kernel (the GPU spinning for the CPU lane) | 26.89 ms, 40 launches |
+| mv_kernel (weight matvecs) | 6.81 ms, 203 launches |
+| gate_up / down (VRAM experts) | 1.60 / 1.09 ms |
+| attn_part (the split attention itself) | 0.44 ms |
+| host | cudaStreamSynchronize 33.4 ms (14.8 calls), cudaLaunchKernel 15.6 ms (1,511), cudaMemcpyAsync 7.3 ms (73) |
+
+So the CPU lane is 27 of 47 ms: ~13 ms of row compute (~45 GB/s), ~9 ms of SSD reads for store misses, ~5 ms where the GPU
+waits but the lane has not started or finished its quantize/hand-off.  CUDA graphs (#5) can win at most the 4.3 ms of idle
+gaps; the sparse attention kernel is no longer a lever (0.44 ms), its stage's time is the projections' matvecs.
+
+## The RAM store's size (screen2.sh 2026-11-15 19:47-20:07, ab.py runs/ab/exp-r3-256k.json 20:09-21:23)
+
+The auto store is the free RAM after the GPU's weights less 12 GB: 86-89 GB at 256K on this PC (9,900-10,300 slots of the
+13,301 CPU-lane experts).  Screen (7 prompts, round 2, paired vs the default): `--ssd-cache 92` +2.7% (7 of 7 prompts
+faster), `--ssd-policy lfu` -1.5%, DS4_STORE_THREADS=16 +0.4%.  Real-turn A/B (30 Hermes turns x 3 rounds, split on,
+frozen profile, ab_clean.py --pmon 5):
+
+| Arm | Median tok/s by round | vs split, clean pairs | all pairs |
+|---|---|---|---|
+| split (auto store, 86 GB) | 26.8, 27.4, 27.0 | - | - |
+| ssd92 (92 GB, 10,569 slots) | 28.1, 28.3, 27.8 | +3.5% [1.1, 6.0], n 58 | +4.7% [2.1, 8.0], n 88 |
+
+Prompt time unchanged (paired 1.004).  Free RAM (logged every 30 s) never went below 11.6 GB.  Adopted as a 6 GB headroom
+rather than a fixed size, so the store still shrinks when other programs hold RAM: DS4_STORE_HEADROOM_GB (new, default 12)
+set to 6 by launch-ds4.ps1.
+
 ## Files
 
 bench_dsv41.py (driver), qcheck.sh (quality), idcheck.sh (identity), longab.sh (long prompts), ab.py/ab_clean.py (A/B), A_default.*, B_dspark.*, C_prof.log (profile), D_trace.bin (routing), cache_sim.py/.out, window_union.py, screen.sh, verify_copy.py/.log.
