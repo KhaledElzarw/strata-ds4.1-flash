@@ -161,6 +161,33 @@ Prompt time unchanged (paired 1.004).  Free RAM (logged every 30 s) never went b
 rather than a fixed size, so the store still shrinks when other programs hold RAM: DS4_STORE_HEADROOM_GB (new, default 12)
 set to 6 by launch-ds4.ps1.
 
+Correction to the timing packet above (found by the design council, Codex gpt-6.1-sol and Gemini 4 Argon, checked in
+the code): the store's SSD waits happen in StoreHold, outside cpu_experts_iq's phases, so the lane's row compute is the
+whole ~21 ms of gate+up+down (about 30 GB/s), not ~13 ms.  Both reviewers put the store's slot size first: every slot is
+sized for the largest layer's blob (8,704,000 bytes), while 17 of the 40 layers need 6,912,000 and the mean is 7,458,048,
+so exact-size slots hold ~16% more experts in the same 92 GB.  Screened and dropped at 256K with the 6 GB headroom (7
+prompts, round 2, paired): DS4_MOE_TOKEN=0 (VRAM down rows before the lane wait) +1.4% (one prompt +8%, the rest ~0);
+DS4_AHEAD=1 (the router lookahead's guesses read into the store) -4.5%, 7 of 7 slower.
+
+## Size-class store slots (2026-11-15/16, ab.py runs/ab/exp-r4-256k.json and exp-r5-256k.json)
+
+ExpertStore now cuts its arena into one class of uniform slots per distinct expert size (six in this pack, 6.9-8.7 MB),
+the budget split so every class holds the same share of its experts (written by Codex gpt-6.1-sol, reviewed and
+rebuilt by the lead; DS4_STORE_CLASSES=0 restores the old uniform slots).  Same bytes in a slot: token identity vs the
+previous exe 7/7, legacy mode 7/7 (idcheck sc1).  Capacity: 11,748 slots in 88.1 GB against 10,466 in 91.1 GB (+16% a GB).
+Real-turn A/B at a fixed `--ssd-cache 88` for both arms (30 Hermes turns x 3 rounds, twice, split on, frozen profile,
+ab_clean.py --pmon 5):
+
+| Run | legacy medians by round | classes medians by round | classes vs legacy, clean pairs | all pairs |
+|---|---|---|---|---|
+| r4 | 26.6, 25.4, 26.9 | 27.5, 28.2, 29.4 | +3.6% [-2.1, 9.0], n 60 | +4.3% [0.0, 8.3], n 89 |
+| r5 | 27.7, 27.4, 27.6 | 29.5, 28.8, 28.1 | +4.0% [2.0, 5.8], n 72 | +4.5% [2.7, 6.2], n 88 |
+
+Prompt time: no consistent effect (paired 0.82x in r4, 1.50x in r5, both from the small prompts' medians; the big
+prompts are equal or faster with classes; pooled mean prompt time 1,866 vs 1,853 ms).  Blender and Unity ran during
+r4's first round: GPU contention, and with the fixed 88 GB store free RAM fell to ~4 GB (so the launcher keeps sizing
+the store by the 6 GB headroom at load, not a fixed size).  Adopted: classes on by default.
+
 ## Files
 
 bench_dsv41.py (driver), qcheck.sh (quality), idcheck.sh (identity), longab.sh (long prompts), ab.py/ab_clean.py (A/B), A_default.*, B_dspark.*, C_prof.log (profile), D_trace.bin (routing), cache_sim.py/.out, window_union.py, screen.sh, verify_copy.py/.log.

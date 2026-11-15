@@ -6631,8 +6631,9 @@ struct Model::Impl {
         if (std::getenv("DS4_AHEAD") == nullptr) ahead_mode = 0;
         for (Layer& l : L)
             if (l.il < g.nl && want_zc) l.zc.assign((size_t) l.n_exp, 0);
-        std::fprintf(stderr, "ds4: RAM store: up to %zu slots of %.1f MB (%.1f GB), policy %d, %d reader threads, %s reads\n",
-                     store->slots_max(), store->slot_bytes() / 1e6, store->slots_max() * (double) store->slot_bytes() / 1e9,
+        std::fprintf(stderr, "ds4: RAM store: up to %zu slots, %zu size classes, %.1f-%.1f MB (%.1f GB), policy %d, %d reader threads, %s reads\n",
+                     store->slots_max(), store->class_count(), store->min_slot_bytes() / 1e6, store->slot_bytes() / 1e6,
+                     store->capacity_bytes() / 1e9,
                      (int) cfg.policy, cfg.threads, direct ? "unbuffered" : "BUFFERED (no direct handle)");
         if (want_zc) {
             if (!store->gpu_mapped()) {
@@ -8749,7 +8750,8 @@ struct Model::Impl {
             std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
             std::vector<std::pair<int, int>> list;
             for (const auto& h : hot) {
-                if (list.size() >= store->slots_max()) break;
+                // preload selects the hottest entries that fit each size class; a global prefix can omit another class.
+                if (store->class_count() == 1 && list.size() >= store->slots_max()) break;
                 list.push_back(h.second);
             }
             const double ts = now_ms();

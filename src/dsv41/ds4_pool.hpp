@@ -180,6 +180,15 @@ public:
         if (n == 1) cv_.notify_one();
         else cv_.notify_all();
     }
+    /// Snapshot before checking a job's left counter, then wait_change(): a completion between the check and wait is remembered.
+    uint64_t done_seen() {
+        std::lock_guard<std::mutex> lk(done_mu_);
+        return done_;
+    }
+    void wait_change(uint64_t seen, int us) {
+        std::unique_lock<std::mutex> lk(done_mu_);
+        done_cv_.wait_for(lk, std::chrono::microseconds(us), [&] { return done_ != seen; });
+    }
     void wait_any(int us) {
         std::unique_lock<std::mutex> lk(done_mu_);
         const uint64_t seen = done_;

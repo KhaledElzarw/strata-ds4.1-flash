@@ -3056,6 +3056,11 @@ if(STRATA_HIP_GFX906)
 endif()
 
 # ---- DeepSeek-V4.1 on a box with no GPU toolkit ------------------------------------------------
+# Synthetic RAM-store coverage: no GPU, model, or ggml dependency; build explicitly by target name.
+add_executable(ds4_store_classes_test EXCLUDE_FROM_ALL tests/dsv41/store_classes_test.cpp)
+target_include_directories(ds4_store_classes_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41 ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(ds4_store_classes_test PRIVATE Threads::Threads)
+
 # The whole DSV41 block above lives inside if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP), so with neither backend on
 # -DSTRATA_BUILD_DSV41=ON was silently unused and the host-side benchmark could not be built at all (found on p1004,
 # 2026-10-23: the CPU lane is exactly what a box without a usable GPU needs to measure).  This branch builds the one target

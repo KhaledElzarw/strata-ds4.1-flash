@@ -28,6 +28,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -76,16 +77,56 @@ public:
         geo_ = layers;
         dfds_ = dfds;
         pfds_ = pfds;
+        const char* env = std::getenv("DS4_STORE_CLASSES");
+        const bool classes = env == nullptr || std::atoi(env) != 0;
         size_t blob = 0;
-        for (const LayerGeo& g : geo_) blob = std::max<size_t>(blob, g.blob);
-        slot_bytes_ = (blob + 2 * kSlack + os::kDirectAlign - 1) & ~(size_t) (os::kDirectAlign - 1);
-        if (blob == 0 || c.budget_bytes < slot_bytes_) return false;
-        nmax_ = c.budget_bytes / slot_bytes_;
+        for (const LayerGeo& g : geo_) {
+            if (g.n_exp < 0 || g.blob > std::numeric_limits<size_t>::max() - 2 * kSlack - os::kDirectAlign) return false;
+            blob = std::max<size_t>(blob, g.blob);
+        }
+        if (blob == 0) return false;
+        std::vector<size_t> sizes;
+        for (const LayerGeo& g : geo_)
+            if (g.n_exp > 0) sizes.push_back(classes ? (size_t) g.blob : blob);
+        std::sort(sizes.begin(), sizes.end());
+        sizes.erase(std::unique(sizes.begin(), sizes.end()), sizes.end());
+        if (sizes.empty() || sizes.front() == 0) return false;
+        layer_class_.resize(geo_.size());
+        classes_.resize(sizes.size());
+        for (size_t i = 0; i < sizes.size(); ++i) {
+            Class& cl = classes_[i];
+            cl.slot_bytes = (sizes[i] + 2 * kSlack + os::kDirectAlign - 1) & ~(size_t) (os::kDirectAlign - 1);
+        }
+        long double weight = 0;
+        for (size_t l = 0; l < geo_.size(); ++l) {
+            if (geo_[l].n_exp == 0) continue;
+            const size_t ci = (size_t) (std::lower_bound(sizes.begin(), sizes.end(), classes ? (size_t) geo_[l].blob : blob) - sizes.begin());
+            layer_class_[l] = ci;
+            classes_[ci].experts += (size_t) geo_[l].n_exp;
+        }
+        for (const Class& cl : classes_) weight += (long double) cl.experts * cl.slot_bytes;
+        slot_bytes_ = classes_.back().slot_bytes;
         // one reserved range for the whole arena (chunks committed as they are needed), 64 KB aligned chunks
-        arena_bytes_ = ((nmax_ + kChunk - 1) / kChunk) * kChunk * slot_bytes_;
+        for (Class& cl : classes_) {
+            const size_t budget = classes_.size() == 1 ? c.budget_bytes :
+                (size_t) ((long double) c.budget_bytes * ((long double) cl.experts * cl.slot_bytes) / weight);
+            cl.nmax = budget / cl.slot_bytes;
+            if (cl.nmax > (size_t) std::numeric_limits<int>::max() - nmax_) return false;
+            cl.lo = nmax_;
+            cl.free_hint = cl.lo;
+            cl.offset = arena_bytes_;
+            nmax_ += cl.nmax;
+            capacity_bytes_ += cl.nmax * cl.slot_bytes;
+            const size_t chunks = (cl.nmax + kChunk - 1) / kChunk;
+            if (chunks > (std::numeric_limits<size_t>::max() - arena_bytes_) / kChunk / cl.slot_bytes) return false;
+            arena_bytes_ += chunks * kChunk * cl.slot_bytes;
+        }
+        if (nmax_ == 0) return false;
         arena_ = (uint8_t*) os::range_reserve(arena_bytes_);
         if (arena_ == nullptr) return false;
         slots_.reset(new Slot[nmax_]);
+        for (size_t ci = 0; ci < classes_.size(); ++ci)
+            for (size_t s = classes_[ci].lo; s < classes_[ci].lo + classes_[ci].nmax; ++s) slots_[s].class_id = ci;
         where_.resize(geo_.size());
         heat_.resize(geo_.size());
         hits_in_layer_.assign(geo_.size(), 0);
@@ -94,7 +135,7 @@ public:
             heat_[l].assign((size_t) geo_[l].n_exp, 0.0f);
         }
         io_.reset(new IoQueue(std::max(1, c.threads)));
-        grow();   // (the first chunk now: whether the GPU can map it is known from the start)
+        for (Class& cl : classes_) grow(cl);   // (mapping known from the start, even if the first class cannot grow)
         // DS4_STORE_PREGROW=1 (default on Linux with the GPU mapping, =0 off): the whole arena now.  cuMemHostRegister (the GPU mapping of a chunk) taken while a kernel of
         // the decode is running waited on it for good on Linux (H100, driver 580): registering all chunks before the first
         // kernel avoids it
@@ -104,18 +145,23 @@ public:
         const bool pregrow = std::getenv("DS4_STORE_PREGROW") != nullptr && std::atoi(std::getenv("DS4_STORE_PREGROW")) != 0;
 #endif
         if (pregrow)
-            while (grow()) {
-            }
+            for (Class& cl : classes_)
+                while (grow(cl)) {
+                }
         return true;
     }
     ~ExpertStore() {
         io_.reset();
-        for (size_t i = 0; i < chunks_.size(); ++i)
-            if (cfg_.unmap_chunk && chunk_dev_[i] != nullptr) cfg_.unmap_chunk(chunks_[i].first);
+        for (const Class& cl : classes_)
+            for (const Chunk& ch : cl.chunks)
+                if (cfg_.unmap_chunk && ch.dev != nullptr) cfg_.unmap_chunk(ch.host);
         os::range_release(arena_, arena_bytes_);
     }
 
     size_t slot_bytes() const { return slot_bytes_; }
+    size_t min_slot_bytes() const { return classes_.empty() ? 0 : classes_.front().slot_bytes; }
+    size_t class_count() const { return classes_.size(); }
+    size_t capacity_bytes() const { return capacity_bytes_; }
     size_t slots_allocated() const { return nalloc_; }
     size_t slots_max() const { return nmax_; }
     const Stats& stats() const { return st_; }
@@ -135,9 +181,12 @@ public:
     const uint8_t* blob(int slot) const { return slots_[(size_t) slot].base; }
     /// The device address of the slot's blob (0: the arena is not mapped for the GPU)
     unsigned long long dev_blob(int slot) const {
-        const size_t c = (size_t) slot / kChunk;
-        if (c >= chunk_dev_.size() || chunk_dev_[c] == nullptr) return 0;
-        return (unsigned long long) ((uint8_t*) chunk_dev_[c] + (slots_[(size_t) slot].base - (uint8_t*) chunks_[c].first));
+        const Slot& sp = slots_[(size_t) slot];
+        const Class& cl = classes_[sp.class_id];
+        const size_t c = ((size_t) slot - cl.lo) / kChunk;
+        if (c >= cl.chunks.size() || cl.chunks[c].dev == nullptr) return 0;
+        const Chunk& ch = cl.chunks[c];
+        return (unsigned long long) ((uintptr_t) ch.dev + (sp.base - (uint8_t*) ch.host));
     }
 
     /// Makes the experts es[0..n) of `layer` ready and pinned (reading what is not here), waiting for the reads; the
@@ -187,7 +236,11 @@ public:
                 continue;
             }
             Slot& sp = slots_[(size_t) s];
-            while (sp.left.load(std::memory_order_acquire) > 0) io_->wait_any(2000);
+            for (;;) {
+                const uint64_t seen = io_->done_seen();
+                if (sp.left.load(std::memory_order_acquire) <= 0) break;
+                io_->wait_change(seen, 2000);
+            }
             std::lock_guard<std::mutex> lk(mu_);
             finish(sp);
             if (sp.state.load() == kReady) ok[(size_t) i] = 1;
@@ -226,22 +279,61 @@ public:
         {
             std::lock_guard<std::mutex> lk(mu_);
             const size_t room = nmax_ > leave ? nmax_ - leave : 0;
-            const size_t take = std::min(list.size(), room);
+            std::vector<std::pair<int, int>> selected;
+            if (classes_.size() > 1) {
+                // Keep the hottest entries that fit EACH class. A full class must not hide colder entries of another.
+                std::vector<size_t> remaining;
+                for (const Class& cl : classes_) {
+                    const size_t keep = class_reserve(cl, leave);
+                    remaining.push_back(cl.nmax - keep);
+                }
+                std::vector<std::vector<char>> chosen(geo_.size());
+                for (size_t l = 0; l < geo_.size(); ++l) chosen[l].assign((size_t) geo_[l].n_exp, 0);
+                for (const auto& entry : list) {
+                    const int l = entry.first, e = entry.second;
+                    if (l < 0 || l >= (int) geo_.size() || e < 0 || e >= geo_[(size_t) l].n_exp) continue;
+                    size_t& left = remaining[layer_class_[(size_t) l]];
+                    if (left == 0 || chosen[(size_t) l][(size_t) e]) continue;
+                    selected.push_back(entry);
+                    chosen[(size_t) l][(size_t) e] = 1;
+                    --left;
+                }
+            }
+            const auto& picks = classes_.size() > 1 ? selected : list;
+            const size_t take = std::min(picks.size(), room);
+            std::vector<int> pinned;
+            if (classes_.size() > 1)
+                for (const auto& entry : picks) {
+                    const int s = where_[(size_t) entry.first][(size_t) entry.second];
+                    if (s >= 0) {
+                        ++slots_[(size_t) s].pin;
+                        pinned.push_back(s);
+                    }
+                }
             for (size_t k = take; k-- > 0;) {   // (coldest first: the hottest get the newest ticks)
-                const int layer = list[k].first, e = list[k].second;
+                const int layer = picks[k].first, e = picks[k].second;
                 if (layer < 0 || layer >= (int) geo_.size() || e < 0 || e >= geo_[(size_t) layer].n_exp) continue;
                 if (where_[(size_t) layer][(size_t) e] >= 0) continue;
                 const int s = start_fill(layer, e, false);
-                if (s < 0) break;
+                if (s < 0) {
+                    if (classes_.size() == 1) break;
+                    continue;
+                }
                 slots_[(size_t) s].prefetch = false;   // (warm, not a guess)
+                if (classes_.size() > 1) {
+                    ++slots_[(size_t) s].pin;   // protect the selected hot set while colder entries are replaced
+                    pinned.push_back(s);
+                }
                 ++n;
             }
+            for (int s : pinned) --slots_[(size_t) s].pin;
         }
-        for (size_t i = 0;; ++i) {   // until every read is done
+        for (;;) {   // until every read is done
+            const uint64_t seen = io_->done_seen();
             bool busy = false;
             {
                 std::lock_guard<std::mutex> lk(mu_);
-                for (size_t j = 0; j < nalloc_; ++j) {
+                for (size_t j = 0; j < nmax_; ++j) {
                     Slot& sp = slots_[j];
                     if (sp.state.load(std::memory_order_acquire) != kLoading) continue;
                     if (sp.left.load(std::memory_order_acquire) > 0) busy = true;
@@ -252,7 +344,7 @@ public:
                 }
             }
             if (!busy) break;
-            io_->wait_any(5000);
+            io_->wait_change(seen, 5000);
         }
         return n;
     }
@@ -263,7 +355,7 @@ public:
         if (layer < 0 || layer >= (int) geo_.size() || e < 0 || e >= geo_[(size_t) layer].n_exp) return nullptr;
         std::lock_guard<std::mutex> lk(mu_);
         if (where_[(size_t) layer][(size_t) e] >= 0) return nullptr;
-        const int s = take_slot(false);
+        const int s = take_slot(classes_[layer_class_[(size_t) layer]]);
         if (s < 0) return nullptr;
         Slot& sp = slots_[(size_t) s];
         if (sp.layer >= 0 && sp.expert >= 0) {
@@ -299,13 +391,14 @@ public:
             sp.layer = sp.expert = -1;
             sp.left.store(0, std::memory_order_release);
             sp.state.store(kFree, std::memory_order_release);
-            free_hint_ = std::min<size_t>(free_hint_, (size_t) s);
+            Class& cl = classes_[sp.class_id];
+            cl.free_hint = std::min<size_t>(cl.free_hint, (size_t) s);
         }
     }
     /// Guesses still waiting in the queue for a layer the token is past: dropped unread (their slots free once the queue has gone by)
     void cancel_stale(int layer_now) {
         std::lock_guard<std::mutex> lk(mu_);
-        for (size_t i = 0; i < nalloc_; ++i) {
+        for (size_t i = 0; i < nmax_; ++i) {
             Slot& sp = slots_[i];
             if (sp.prefetch && sp.pin == 0 && sp.layer >= 0 && sp.layer <= layer_now && sp.state.load(std::memory_order_acquire) == kLoading)
                 sp.cancel.store(true, std::memory_order_release);
@@ -319,13 +412,20 @@ public:
         const int s = where_[(size_t) layer][(size_t) e];
         if (s >= 0) slots_[(size_t) s].tick = ++clock_;
     }
-    bool gpu_mapped() const { return !chunk_dev_.empty() && chunk_dev_[0] != nullptr; }
+    bool gpu_mapped() const {
+        if (classes_.size() == 1) return !classes_[0].chunks.empty() && classes_[0].chunks[0].dev != nullptr;
+        for (const Class& cl : classes_)
+            for (const Chunk& ch : cl.chunks)
+                if (ch.dev != nullptr) return true;
+        return false;
+    }
     /// The arena's address range (the device sees its host pointers as they are when the mapping is the identity)
     unsigned long long arena_lo() const { return (unsigned long long) (uintptr_t) arena_; }
     unsigned long long arena_hi() const { return (unsigned long long) (uintptr_t) (arena_ + arena_bytes_); }
     bool identity_mapped() const {
-        for (size_t i = 0; i < chunks_.size(); ++i)
-            if (chunk_dev_[i] != nullptr && chunk_dev_[i] != chunks_[i].first) return false;
+        for (const Class& cl : classes_)
+            for (const Chunk& ch : cl.chunks)
+                if (ch.dev != nullptr && ch.dev != ch.host) return false;
         return true;
     }
     size_t max_blob() const { return slot_bytes_ - 2 * kSlack; }
@@ -335,56 +435,62 @@ public:
     /// slots of the lowest score are taken back until `cfg.reserve` slots can be given up.  Returns the number of events.
     size_t sync(std::vector<Vis>& ev, const std::function<bool(int, int)>& gpu_ok) {
         std::lock_guard<std::mutex> lk(mu_);
-        size_t nvis = 0, nfree = 0;
-        for (size_t i = 0; i < nalloc_; ++i) {
-            Slot& sp = slots_[i];
-            if (sp.state.load(std::memory_order_acquire) == kLoading && sp.left.load(std::memory_order_acquire) == 0) {
-                try_ready(sp);
-                if (sp.state.load(std::memory_order_acquire) == kLoading) finish(sp);
+        for (const Class& cl : classes_) {
+            size_t nvis = 0, nfree = 0;
+            for (size_t i = cl.lo; i < cl.lo + cl.nalloc; ++i) {
+                Slot& sp = slots_[i];
+                if (sp.state.load(std::memory_order_acquire) == kLoading && sp.left.load(std::memory_order_acquire) == 0) {
+                    try_ready(sp);
+                    if (sp.state.load(std::memory_order_acquire) == kLoading) finish(sp);
+                }
+                const int st = sp.state.load(std::memory_order_acquire);
+                if (st == kFree) {
+                    ++nfree;
+                    continue;
+                }
+                if (st != kReady) continue;
+                if (sp.visible) {
+                    ++nvis;
+                    continue;
+                }
+                if (sp.pin == 0) ++nfree;
+                if (sp.pin == 0 && dev_blob((int) i) != 0 && gpu_ok(sp.layer, sp.expert) && !sp.prefetch && vis_hash(sp.layer, sp.expert) < cfg_.vis_percent) {
+                    sp.visible = true;
+                    ++nvis;
+                    if (sp.pin == 0) --nfree;
+                    ev.push_back({sp.layer, sp.expert, dev_blob((int) i)});
+                }
             }
-            const int st = sp.state.load(std::memory_order_acquire);
-            if (st == kFree) {
-                ++nfree;
-                continue;
-            }
-            if (st != kReady) continue;
-            if (sp.visible) {
-                ++nvis;
-                continue;
-            }
-            if (sp.pin == 0) ++nfree;
-            if (sp.pin == 0 && dev_blob((int) i) != 0 && gpu_ok(sp.layer, sp.expert) && !sp.prefetch && vis_hash(sp.layer, sp.expert) < cfg_.vis_percent) {
-                sp.visible = true;
-                ++nvis;
-                if (sp.pin == 0) --nfree;
-                ev.push_back({sp.layer, sp.expert, dev_blob((int) i)});
-            }
-        }
-        // give slots back until the reserve is there: the visible ones with the lowest score
-        if (nfree < cfg_.reserve && nvis > 0) {
-            std::vector<std::pair<double, size_t>> cand;
-            cand.reserve(nvis);
-            for (size_t i = 0; i < nalloc_; ++i)
-                if (slots_[i].visible && slots_[i].state.load(std::memory_order_acquire) == kReady) cand.push_back({score(slots_[i]), i});
-            const size_t want = std::min(cand.size(), cfg_.reserve - nfree);
-            std::partial_sort(cand.begin(), cand.begin() + (long) want, cand.end());
-            for (size_t k = 0; k < want; ++k) {
-                Slot& sp = slots_[cand[k].second];
-                sp.visible = false;
-                ev.push_back({sp.layer, sp.expert, 0ull});
+            // give slots back until the reserve is there: the visible ones with the lowest score
+            const size_t reserve = class_reserve(cl, cfg_.reserve);
+            if (nfree < reserve && nvis > 0) {
+                std::vector<std::pair<double, size_t>> cand;
+                cand.reserve(nvis);
+                for (size_t i = cl.lo; i < cl.lo + cl.nalloc; ++i)
+                    if (slots_[i].visible && slots_[i].state.load(std::memory_order_acquire) == kReady) cand.push_back({score(slots_[i]), i});
+                const size_t want = std::min(cand.size(), reserve - nfree);
+                std::partial_sort(cand.begin(), cand.begin() + (long) want, cand.end());
+                for (size_t k = 0; k < want; ++k) {
+                    Slot& sp = slots_[cand[k].second];
+                    sp.visible = false;
+                    ev.push_back({sp.layer, sp.expert, 0ull});
+                }
             }
         }
         return ev.size();
     }
-    /// RAM is short: gives back whole chunks from the end of the arena (their experts forgotten) - up to `want`, stopping at one
+    /// RAM is short: gives back the last chunk of the class with the most committed chunks - up to `want`, stopping at one
     /// with a slot in use (pinned, loading, or GPU-visible).  Returns the chunks given back.
     size_t shrink_chunks(size_t want) {
         std::lock_guard<std::mutex> lk(mu_);
         size_t done = 0;
-        while (done < want && !chunks_.empty()) {
-            const size_t c = chunks_.size() - 1, first = c * kChunk;
+        while (done < want) {
+            auto it = std::max_element(classes_.begin(), classes_.end(), [](const Class& a, const Class& b) { return a.chunks.size() < b.chunks.size(); });
+            if (it == classes_.end() || it->chunks.empty()) break;
+            Class& cl = *it;
+            const size_t first = cl.lo + (cl.chunks.size() - 1) * kChunk, end = cl.lo + cl.nalloc;
             bool busy = false;
-            for (size_t i = first; i < nalloc_ && !busy; ++i) {
+            for (size_t i = first; i < end && !busy; ++i) {
                 Slot& sp = slots_[i];
                 if (sp.state.load(std::memory_order_acquire) == kLoading && sp.left.load(std::memory_order_acquire) == 0) {   // (read by now)
                     try_ready(sp);
@@ -393,7 +499,7 @@ public:
                 busy = sp.pin > 0 || sp.visible || sp.state.load(std::memory_order_acquire) == kLoading;
             }
             if (busy) break;
-            for (size_t i = first; i < nalloc_; ++i) {
+            for (size_t i = first; i < end; ++i) {
                 Slot& sp = slots_[i];
                 if (sp.layer >= 0 && sp.expert >= 0) {
                     where_[(size_t) sp.layer][(size_t) sp.expert] = -1;
@@ -404,12 +510,13 @@ public:
                 sp.state.store(kFree, std::memory_order_release);
                 sp.base = nullptr;
             }
-            if (cfg_.unmap_chunk && chunk_dev_[c] != nullptr) cfg_.unmap_chunk(chunks_[c].first);
-            os::range_decommit(chunks_[c].first, chunks_[c].second);
-            chunks_.pop_back();
-            chunk_dev_.pop_back();
-            nalloc_ = first;
-            free_hint_ = std::min(free_hint_, first);
+            const Chunk& ch = cl.chunks.back();
+            if (cfg_.unmap_chunk && ch.dev != nullptr) cfg_.unmap_chunk(ch.host);
+            os::range_decommit(ch.host, ch.bytes);
+            cl.chunks.pop_back();
+            nalloc_ -= end - first;
+            cl.nalloc = first - cl.lo;
+            cl.free_hint = std::min(cl.free_hint, first);
             ++done;
             ++shrunk_;
         }
@@ -425,7 +532,7 @@ public:
     }
     size_t visible_count() const {
         size_t n = 0;
-        for (size_t i = 0; i < nalloc_; ++i) n += slots_[i].visible ? 1 : 0;
+        for (size_t i = 0; i < nmax_; ++i) n += slots_[i].visible ? 1 : 0;
         return n;
     }
 
@@ -438,8 +545,24 @@ private:
         return v >= 8 && v <= 4096 ? (size_t) v : 64;
     }
     const size_t kChunk = chunk_slots();
+    struct Chunk {
+        void* host = nullptr;
+        size_t bytes = 0;
+        void* dev = nullptr;
+    };
+    struct Class {
+        size_t slot_bytes = 0, experts = 0, lo = 0, nmax = 0, nalloc = 0, free_hint = 0, offset = 0;
+        std::vector<Chunk> chunks;
+    };
+    // Apportion an exact slot reserve (including rounding) across the global id ranges. One class keeps the old reserve.
+    size_t class_reserve(const Class& cl, size_t reserve) const {
+        if (classes_.size() == 1) return reserve;
+        reserve = std::min(reserve, nmax_);
+        return (cl.lo + cl.nmax) * reserve / nmax_ - cl.lo * reserve / nmax_;
+    }
     struct Slot {
         uint8_t* base = nullptr;   // the blob's first byte
+        size_t class_id = 0;
         int layer = -1, expert = -1, pin = 0;
         bool prefetch = false, visible = false;
         std::atomic<int> state{kFree}, left{0};
@@ -459,7 +582,7 @@ private:
     }
     // a slot for (layer, e) and its reads started; -1 if there is none to be had.  mu_ held.
     int start_fill(int layer, int e, bool demand) {
-        int s = take_slot(demand);
+        int s = take_slot(classes_[layer_class_[(size_t) layer]]);
         if (s < 0) {
             st_.no_slot.fetch_add(1, std::memory_order_relaxed);
             return -1;
@@ -524,38 +647,43 @@ private:
         }
         sp.state.store(kReady, std::memory_order_release);
     }
-    bool grow() {
-        if (nalloc_ >= nmax_) return false;
-        const size_t n = std::min(kChunk, nmax_ - nalloc_);
-        const size_t bytes = n * slot_bytes_;
+    bool grow(Class& cl) {
+        if (cl.nalloc >= cl.nmax) return false;
+        const size_t n = std::min(kChunk, cl.nmax - cl.nalloc);
+        const size_t bytes = n * cl.slot_bytes;
         const uint64_t avail = cfg_.ram_avail ? cfg_.ram_avail() : ~uint64_t{0};
-        if (avail != ~uint64_t{0} && avail < bytes + cfg_.floor_bytes) return false;
-        void* p = arena_ + nalloc_ * slot_bytes_;
+        if (avail != ~uint64_t{0} && (avail < bytes || avail - bytes < cfg_.floor_bytes)) return false;
+        void* p = arena_ + cl.offset + cl.nalloc * cl.slot_bytes;
         if (!os::range_commit(p, bytes)) return false;
-        chunks_.push_back({p, bytes});
         void* dev = cfg_.map_chunk ? cfg_.map_chunk(p, bytes) : nullptr;
-        chunk_dev_.push_back(dev);
-        for (size_t i = 0; i < n; ++i) slots_[nalloc_ + i].base = (uint8_t*) p + i * slot_bytes_ + kSlack;
+        cl.chunks.push_back({p, bytes, dev});
+        for (size_t i = 0; i < n; ++i) slots_[cl.lo + cl.nalloc + i].base = (uint8_t*) p + i * cl.slot_bytes + kSlack;
+        cl.nalloc += n;
         nalloc_ += n;
         return true;
     }
     // the slot to give up (or a free one): the policy's lowest among the unpinned, not visible, ready ones.  mu_ held.
-    int take_slot(bool demand) {
-        for (size_t i = free_hint_; i < nalloc_; ++i)
-            if (slots_[i].state.load(std::memory_order_acquire) == kFree) {
-                free_hint_ = i + 1;
+    int take_slot(Class& cl) {
+        for (size_t i = cl.free_hint; i < cl.lo + cl.nalloc; ++i)
+            if (slots_[i].state.load(std::memory_order_acquire) == kFree && (classes_.size() == 1 || slots_[i].pin == 0)) {
+                cl.free_hint = i + 1;
                 return (int) i;
             }
-        if (grow()) return take_slot(demand);
+        if (grow(cl)) return take_slot(cl);
         int best = -1;
         double bv = 0;
-        for (size_t i = 0; i < nalloc_; ++i) {
+        for (size_t i = cl.lo; i < cl.lo + cl.nalloc; ++i) {
             Slot& sp = slots_[i];
+            // A completed failure may have been cleaned by preload/wait_slots below the hint.
+            if (classes_.size() > 1 && sp.state.load(std::memory_order_acquire) == kFree && sp.pin == 0) {
+                cl.free_hint = std::min(cl.free_hint, i);
+                return (int) i;
+            }
             if (sp.state.load(std::memory_order_acquire) == kLoading && sp.left.load(std::memory_order_acquire) == 0) {
                 try_ready(sp);
                 if (sp.state.load(std::memory_order_acquire) == kLoading) finish(sp);
-                if (sp.state.load(std::memory_order_acquire) == kFree) {
-                    free_hint_ = std::min(free_hint_, i);
+                if (sp.state.load(std::memory_order_acquire) == kFree && (classes_.size() == 1 || sp.pin == 0)) {
+                    cl.free_hint = std::min(cl.free_hint, i);
                     return (int) i;
                 }
             }
@@ -567,19 +695,19 @@ private:
             }
         }
         if (best < 0) return -1;
-        free_hint_ = std::min<size_t>(free_hint_, (size_t) best);
+        cl.free_hint = std::min<size_t>(cl.free_hint, (size_t) best);
         return best;
     }
 
     Cfg cfg_;
     std::vector<LayerGeo> geo_;
     std::vector<os::fd_t> dfds_, pfds_;
-    size_t slot_bytes_ = 0, nmax_ = 0, nalloc_ = 0, free_hint_ = 0, arena_bytes_ = 0;
+    size_t slot_bytes_ = 0, nmax_ = 0, nalloc_ = 0, arena_bytes_ = 0, capacity_bytes_ = 0;
     uint8_t* arena_ = nullptr;
     size_t shrunk_ = 0;
     std::unique_ptr<Slot[]> slots_;
-    std::vector<std::pair<void*, size_t>> chunks_;
-    std::vector<void*> chunk_dev_;
+    std::vector<Class> classes_;
+    std::vector<size_t> layer_class_;
     std::vector<std::vector<int>> where_;
     std::vector<std::vector<float>> heat_;
     std::vector<uint64_t> hits_in_layer_;
