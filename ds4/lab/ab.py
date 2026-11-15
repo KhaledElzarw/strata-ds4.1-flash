@@ -44,7 +44,7 @@ import replay  # noqa: E402
 def stop_server():
     subprocess.run(["powershell", "-NoProfile", "-Command", KILL], capture_output=True)
     for _ in range(60):
-        r = subprocess.run(["tasklist"], capture_output=True, text=True)
+        r = subprocess.run(["tasklist"], capture_output=True, text=True, errors="replace")
         if "strata.exe" not in r.stdout and "strata-dsv41.exe" not in r.stdout:
             return
         time.sleep(0.5)
