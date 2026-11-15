@@ -16,6 +16,7 @@
 #include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/iq_avx512.hpp"
 
+#include <atomic>
 #include <mutex>
 #include <vector>
 #if defined(_MSC_VER)
@@ -90,8 +91,9 @@ void gg_cpu_quant(int act, const float* x, int k, void* dst) {
 // answer, at any number of tokens - the choice is speed only.  Measured on the rows alone: no faster than ggml's dot at one token
 // (both wait for the codebook lookups), x1.7-2.9 at 2-4 tokens, x1.4 on IQ3_S already at one; so by default ggml's dot below
 // min_tokens(type) and these rows from there.  DS4_GG_IQ256=0 never takes them, =1 always (the old opt-in).
-static int g_iq256 = -1;   // -1: from the environment and the CPU, 0 off, 1 always, 2 from min_tokens(type)
-void gg_cpu_set_iq256(int mode) { g_iq256 = mode; }
+// (atomic: the pool's workers reach the first read together; relaxed, every thread works out the same value)
+static std::atomic<int> g_iq256{-1};   // -1: from the environment and the CPU, 0 off, 1 always, 2 from min_tokens(type)
+void gg_cpu_set_iq256(int mode) { g_iq256.store(mode, std::memory_order_relaxed); }
 // IQ1_M from one token too: ggml's own IQ1_M dot (and IQ1_S's) uses _pdep_u64 where the build has BMI2, which AMD Zen 1/2 run in
 // microcode - 1.8 GB/s against these rows' 33 GB/s on an EPYC 7452 (a 2.00 set decodes 3x slower on one card), 19-31 GB/s on Intel.
 // The rows are bit-identical, so taking them at every token count only changes the speed.
@@ -178,14 +180,16 @@ static int amd_family() {
 }
 // DS4_GG_IQ512: 1 takes the AVX-512 rows (bit-identical too) where the CPU has AVX-512 F/BW/VL/DQ/VNNI/VBMI, 0 never; unset: the rule
 // below, from the measurements on Zen 4.
-static int g_iq512 = -1;
+static std::atomic<int> g_iq512{-1};   // (atomic: as g_iq256)
 static bool want_512(int type, int nt) {
-    if (g_iq512 < 0) {
+    int m512 = g_iq512.load(std::memory_order_relaxed);
+    if (m512 < 0) {
         const char* v = std::getenv("DS4_GG_IQ512");
-        g_iq512 = !strata::kernels::cpu::cpu_avx512_ok() ? 0 : v == nullptr ? 2 : std::atoi(v) != 0 ? 1 : 0;
+        m512 = !strata::kernels::cpu::cpu_avx512_ok() ? 0 : v == nullptr ? 2 : std::atoi(v) != 0 ? 1 : 0;
+        g_iq512.store(m512, std::memory_order_relaxed);
     }
-    if (g_iq512 == 0 || !strata::kernels::cpu::iq512x_supported(type)) return false;
-    if (g_iq512 == 1) return true;
+    if (m512 == 0 || !strata::kernels::cpu::iq512x_supported(type)) return false;
+    if (m512 == 1) return true;
     // by CPU (measured, ds4_gg_bench --expert; the rows are bit-identical to ggml's dot everywhere):
     //  Zen 5 (AMD family 0x1A, Strix Halo, 16 threads, GB/s of weights ggml -> AVX-512 rows): one token IQ2_XXS 35 -> 44, IQ2_XS 37 -> 48,
     //  IQ1_M 32 -> 36 (the sign masks by popcount, IQ1_M's indices by pdep: no table loads), IQ3_XXS 43 -> 45; 4 tokens x2.5-3.5; 16 tokens x4.4-4.8;
@@ -206,16 +210,18 @@ static bool want_512(int type, int nt) {
 }
 // 0: ggml-cpu's dot, 1: the AVX2 rows, 2: the AVX-512 rows
 static int use_iq256(int type, int nt) {
-    if (g_iq256 < 0) {
+    int m256 = g_iq256.load(std::memory_order_relaxed);
+    if (m256 < 0) {
         const char* v = std::getenv("DS4_GG_IQ256");
         // (ggml-cpu's own answer: built with AVX2 + FMA + F16C, which is also what makes its dots the AVX2 ones these rows match)
         const bool avx2 = ggml_cpu_has_avx2() && ggml_cpu_has_fma() && ggml_cpu_has_f16c();
-        g_iq256 = !avx2 ? 0 : v == nullptr ? 2 : std::atoi(v) != 0 ? 1 : 0;
+        m256 = !avx2 ? 0 : v == nullptr ? 2 : std::atoi(v) != 0 ? 1 : 0;
+        g_iq256.store(m256, std::memory_order_relaxed);
     }
-    if (g_iq256 == 0) return 0;
+    if (m256 == 0) return 0;
     if (want_512(type, nt) && own_ok(type, 1)) return 2;
     if (!strata::kernels::cpu::iq256x_supported(type)) return 0;
-    if (g_iq256 == 2 && nt < min_tokens(type)) return 0;
+    if (m256 == 2 && nt < min_tokens(type)) return 0;
     return own_ok(type, 0) ? 1 : 0;
 }
 

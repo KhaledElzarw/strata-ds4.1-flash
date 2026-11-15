@@ -2490,8 +2490,11 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
         return;
     }
     // a decode step / short verify window of packed rows: the split-KV kernel (Strata's CUDA lab, ds4_attn_split.cuh; 2.9x at
-    // one query on an A4000).  The same inputs; the merge sums the chunks in another order, so the bits differ in the last
-    // place (4e-7 against a double reference).  DS4_ATTN_SPLIT=1 turns it on (off by default: no measurable decode gain on the R9700 box, the decode is bound elsewhere).
+    // one query on an A4000).  The same inputs; the merge sums the chunks in another order and its exponentials are __expf
+    // (the scalar kernels' are expf; this file has no fast math), so the bits differ in the last places (4e-7 against a
+    // double reference; teacher-forced on one 3090 it is inside the engine's own placement noise, ds4/lab/RESULTS.md).
+    // DS4_ATTN_SPLIT=1 turns it on (off by default: no measurable decode gain on the R9700 box, the decode is bound
+    // elsewhere; ds4/launch-ds4.ps1 turns it on for the 3090, +3.6% real agent turns at 256K).
     if (ckv_fmt == kKvFp4 && a.gen == 0 && T >= 1 && T <= kSplitMaxT && heads % kSplitG == 0 && split_enabled()) {
         int total_max = 0;
         for (int t = 0; t < T; ++t) total_max = std::max(total_max, a.nwin[t] + a.nsel[t]);
