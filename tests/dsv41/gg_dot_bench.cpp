@@ -1,6 +1,13 @@
 // Strata. The DeepSeek-V4.1 CPU lane's ggml-type rows (src/dsv41/ds4_gg_cpu.cpp): ggml-cpu's row dot against Strata's AVX2
-// multi-token i-quant rows, on random blocks of IQ2_XXS / IQ3_XXS.
-//   ds4_gg_bench [--type 16|18] [--threads N] [--mb M] [--nt 1..8] [--reps R]
+// multi-token i-quant rows, including IQ1_S (19) and IQ1_M (29).
+//   ds4_gg_bench [--type 16|17|18|19|21|22|29] [--threads N] [--mb M] [--nt 1..64] [--reps R]
+//                [--exact] [--k512|--k256] [--n 256-multiple] [--seed N] [--dump FILE]
+//   ds4_gg_bench --expert [--type GATE_TYPE] [--dtype DOWN_TYPE] [--nt 1..64] [--threads N] [--mb M] [--reps R]
+// --k512 / --k256 bypass dispatch and its parity fallback, and time the named rows directly. --expert accepts IQ1_S too,
+// uses the engine's dispatch, and compares the final outputs of ggml / auto / forced-own modes bit for bit.
+// Without a direct mode, rows use the engine's environment and CPU dispatch policy.
+// --self-test checks IQ1_S directly: all grid entries, scales/signs, finite F16 scale extremes, zero activations,
+// row-range sentinels, odd block counts, every nt 0..64 and larger tile tails (65, 127).
 // Checks first (every row, every token): the two paths' results agree to a few float ulps (the integer sums are the same;
 // only the order of the float additions differs) and, with --exact, bit for bit.  Then the time of a pass over M MB of
 // weights (default 3072, far past L3) on N threads, as GB/s of weights read, beside a plain streaming read of the same
@@ -9,6 +16,7 @@
 
 #include "ggml-cpu.h"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/iq_avx512.hpp"
 #include "ggml.h"
 
@@ -121,10 +129,74 @@ static int run_expert(int tg, int td, int threads, long mb, int nt, int reps) {
     return rc;
 }
 
+static int test_iq1s() {
+    ggml_cpu_init();
+    if (!strata::kernels::cpu::cpu_avx512_ok() || !strata::kernels::cpu::iq512x_supported(19)) {
+        std::fprintf(stderr, "IQ1_S self-test requires the AVX-512 rows\n");
+        return 3;
+    }
+    const ggml_type_traits_cpu* tc = ggml_get_type_traits_cpu(GGML_TYPE_IQ1_S);
+    constexpr int rows = 11, max_nt = 127;
+    const ggml_fp16_t scales[] = {0, 0x8000, 1, 0x8001, 0x3ff, 0x400, 0x800, 0x3555, 0xb555, 0x7bff, 0xfbff};
+    long checked = 0;
+    int cases = 0;
+    for (int n : {256, 512, 768, 2304, 5120}) {
+        const size_t rb = ggml_row_size(GGML_TYPE_IQ1_S, n), bb = ggml_type_size(GGML_TYPE_IQ1_S);
+        const size_t ab = ggml_row_size(tc->vec_dot_type, n);
+        std::vector<uint8_t> w(rows * rb);
+        for (size_t o = 0; o < w.size(); o += bb) {
+            const size_t b = o / bb;
+            std::memcpy(w.data() + o, &scales[b % (sizeof scales / sizeof *scales)], 2);
+            for (int c = 0; c < 8; ++c) {
+                uint16_t h = (uint16_t) (((b + c) % 16) << 12);
+                for (int k = 0; k < 4; ++k) {
+                    const unsigned idx = (unsigned) ((b * 32 + 4 * c + k) % 2048);
+                    w[o + 2 + 4 * c + k] = (uint8_t) idx;
+                    h |= (uint16_t) ((idx >> 8) << (3 * k));
+                }
+                std::memcpy(w.data() + o + 34 + 2 * c, &h, 2);
+            }
+        }
+        std::vector<std::vector<uint8_t>> a(max_nt, std::vector<uint8_t>(ab));
+        std::vector<const void*> ap(max_nt);
+        std::vector<std::vector<float>> ref(max_nt, std::vector<float>(rows, -12345.0f)), got = ref;
+        std::vector<float*> out(max_nt);
+        for (int t = 0; t < max_nt; ++t) {
+            std::vector<float> x((size_t) n);
+            for (int j = 0; j < n; ++j)
+                x[(size_t) j] = t == 0 ? 0.0f : (float) (((j * 73 + t * 17) % 255) - 127) * (t % 3 == 0 ? 0.001f : 1.0f);
+            gg_cpu_quant((int) tc->vec_dot_type, x.data(), n, a[(size_t) t].data());
+            ap[(size_t) t] = a[(size_t) t].data();
+            out[(size_t) t] = got[(size_t) t].data();
+            for (int r = 1; r < rows - 1; ++r)
+                tc->vec_dot(n, &ref[(size_t) t][(size_t) r], 0, w.data() + (size_t) r * rb, 0, ap[(size_t) t], 0, 1);
+        }
+        for (int nt = 0; nt <= max_nt; ++nt) {
+            if (nt > 64 && nt != 65 && nt != 127) continue;
+            for (auto& v : got) std::fill(v.begin(), v.end(), -12345.0f);
+            strata::kernels::cpu::iq512x_rows(19, w.data(), rb, n, ap.data(), nt, out.data(), 1, rows - 1);
+            for (int t = 0; t < max_nt; ++t)
+                for (int r = 0; r < rows; ++r) {
+                    const float expected = t < nt ? ref[(size_t) t][(size_t) r] : -12345.0f;
+                    if (std::memcmp(&expected, &got[(size_t) t][(size_t) r], sizeof(float)) != 0) {
+                        std::fprintf(stderr, "IQ1_S self-test FAIL: n %d nt %d token %d row %d: ggml %.9g rows %.9g\n",
+                                     n, nt, t, r, expected, got[(size_t) t][(size_t) r]);
+                        return 1;
+                    }
+                    ++checked;
+                }
+            ++cases;
+        }
+    }
+    std::printf("IQ1_S self-test: %d cases, %ld output/sentinel checks, 0 differ in bits; OK\n", cases, checked);
+    return 0;
+}
+
 int main(int argc, char** argv) {
-    int type = 18, threads = 32, nt = 1, reps = 3;
+    int type = 18, threads = 32, nt = 1, reps = 3, n = 5120;
     long mb = 3072;
-    bool exact = false, expert = false, k512 = false;
+    bool exact = false, expert = false, k512 = false, k256 = false, self_test = false;
+    uint64_t seed = 0;
     int dtype = -1;
     std::string dump;   // --dump FILE: ggml-cpu's results (nt x rows floats) written raw - compare two builds with cmp
     for (int i = 1; i < argc; ++i) {
@@ -138,12 +210,21 @@ int main(int argc, char** argv) {
         else if (a == "--exact") exact = true;
         else if (a == "--expert") expert = true;
         else if (a == "--k512") k512 = true;
+        else if (a == "--k256") k256 = true;
+        else if (a == "--self-test") self_test = true;
+        else if (a == "--n") n = (int) val();
+        else if (a == "--seed") seed = (uint64_t) val();
         else if (a == "--dtype") dtype = (int) val();
         else if (a == "--dump" && i + 1 < argc) dump = argv[++i];
     }
+    if (threads < 1 || mb < 1 || nt < 1 || nt > 64 || reps < 1 || n < 256 || n % 256 != 0 ||
+        (k512 && k256) || (expert && (k512 || k256))) {
+        std::fprintf(stderr, "invalid arguments: positive threads/MB/reps, nt 1..64, n a positive multiple of 256; direct modes are row-only\n");
+        return 2;
+    }
+    if (self_test) return test_iq1s();
     if (expert) return run_expert(type, dtype < 0 ? type : dtype, threads, mb, nt, reps);
     ggml_cpu_init();
-    const int n = 5120;   // a gate / up row
     IqCpu f;
     std::string err;
     if (!gg_cpu_fmt(type, type, n, 2304, f, err)) {
@@ -153,7 +234,7 @@ int main(int argc, char** argv) {
     const size_t rb = f.gu_row;
     const long rows = (long) ((size_t) mb * 1000000 / rb) / 8 * 8;
     std::vector<uint8_t> w((size_t) rows * rb);
-    uint64_t st = 0x9E3779B97F4A7C15ull;
+    uint64_t st = 0x9E3779B97F4A7C15ull ^ (seed * 0xD1B54A32D192ED03ull);
     auto next = [&st] { st ^= st << 13; st ^= st >> 7; st ^= st << 17; return st; };
     for (size_t o = 0; o + 8 <= w.size(); o += 8) { const uint64_t v = next(); std::memcpy(&w[o], &v, 8); }
     const size_t bb = ggml_type_size((ggml_type) type);
@@ -176,32 +257,19 @@ int main(int argc, char** argv) {
         gg_cpu_quant(f.gu_act, x.data(), n, a[(size_t) t].data());
         ap[(size_t) t] = a[(size_t) t].data();
     }
-    if (k512) {   // --k512: Strata's AVX-512 rows (iq512x_rows) called directly against ggml-cpu's dot, bit for bit: no dispatcher in between
-        const bool cpu_ok = strata::kernels::cpu::cpu_avx512_ok(), sup = strata::kernels::cpu::iq512x_supported(type);
-        std::printf("k512: type %d nt %d: cpu_avx512_ok %d, iq512x_supported %d%s\n", type, nt, (int) cpu_ok, (int) sup,
-                    cpu_ok && sup ? "" : "  -> the AVX-512 rows cannot run here");
+    if (k512 || k256) {
+        const bool cpu_ok = k512 ? strata::kernels::cpu::cpu_avx512_ok() : strata::kernels::cpu::cpu_avx2_ok();
+        const bool sup = k512 ? strata::kernels::cpu::iq512x_supported(type) : strata::kernels::cpu::iq256x_supported(type);
+        std::printf("direct %s: type %d nt %d: cpu_ok %d, supported %d\n", k512 ? "AVX512" : "AVX2", type, nt, (int) cpu_ok, (int) sup);
         if (!cpu_ok || !sup) return 3;
-        const ggml_type_traits_cpu* tc = ggml_get_type_traits_cpu((ggml_type) type);
-        std::vector<std::vector<float>> r0v((size_t) nt, std::vector<float>((size_t) rows)), r1v = r0v;
-        std::vector<float*> q1;
-        for (int t = 0; t < nt; ++t) q1.push_back(r1v[(size_t) t].data());
-        for (long r = 0; r < rows; ++r)
-            for (int t = 0; t < nt; ++t) tc->vec_dot(n, &r0v[(size_t) t][(size_t) r], 0, w.data() + (size_t) r * rb, 0, ap[(size_t) t], 0, 1);
-        strata::kernels::cpu::iq512x_rows(type, w.data(), rb, n, ap.data(), nt, q1.data(), 0, (int) rows);
-        long dif = 0;
-        for (int t = 0; t < nt; ++t)
-            for (long r = 0; r < rows; ++r)
-                if (std::memcmp(&r0v[(size_t) t][(size_t) r], &r1v[(size_t) t][(size_t) r], 4) != 0) ++dif;
-        std::printf("k512: iq512x_rows against ggml-cpu's dot: %ld of %ld differ in bits\n%s\n", dif, (long) nt * rows, dif == 0 ? "OK" : "FAIL");
-        return dif == 0 ? 0 : 1;
     }
     std::vector<std::vector<float>> o0((size_t) nt, std::vector<float>((size_t) rows)), o1 = o0;
     std::vector<float*> p0, p1;
     for (int t = 0; t < nt; ++t) { p0.push_back(o0[(size_t) t].data()); p1.push_back(o1[(size_t) t].data()); }
 
-    // a pass over all rows on `threads` threads, mode 0 ggml-cpu, 1 Strata's rows; returns the best time of reps
+    // A pass over all rows: mode 0 ggml-cpu, 1 environment/CPU dispatch (or the named direct kernel).
     auto pass = [&](int mode, float* const* out) {
-        gg_cpu_set_iq256(mode);
+        gg_cpu_set_iq256(mode == 0 ? 0 : -1);
         double best = 1e30;
         for (int r = 0; r < reps + 1; ++r) {
             const auto t0 = clk::now();
@@ -214,7 +282,12 @@ int main(int argc, char** argv) {
                         const long r0 = cursor.fetch_add(chunk);
                         if (r0 >= rows) break;
                         // one "expert part" is 2304 rows; the engine hands a thread a few rows of it at a time
-                        gg_cpu_down(f, w.data(), ap.data(), nt, out, (int) r0, (int) std::min(rows, r0 + chunk));
+                        const int r1 = (int) std::min(rows, r0 + chunk);
+                        if (mode == 1 && k512)
+                            strata::kernels::cpu::iq512x_rows(type, w.data(), rb, n, ap.data(), nt, out, (int) r0, r1);
+                        else if (mode == 1 && k256)
+                            strata::kernels::cpu::iq256x_rows(type, w.data(), rb, n, ap.data(), nt, out, (int) r0, r1);
+                        else gg_cpu_down(f, w.data(), ap.data(), nt, out, (int) r0, r1);
                     }
                 });
             for (auto& t : th) t.join();
@@ -300,8 +373,8 @@ int main(int argc, char** argv) {
     }
     const double gb = (double) w.size() / 1e9;
     std::printf("type %d nt %d threads %d: %.2f GB of weights (%ld rows)\n", type, nt, threads, gb, rows);
-    std::printf("  ggml-cpu rows %.3f s = %.1f GB/s | Strata AVX2 rows %.3f s = %.1f GB/s (x%.2f) | plain read %.1f GB/s\n", t_gg, gb / t_gg,
-                t_own, gb / t_own, t_gg / t_own, gb / t_rd);
+    std::printf("  ggml-cpu rows %.3f s = %.1f GB/s | Strata %s rows %.3f s = %.1f GB/s (x%.2f) | plain read %.1f GB/s\n", t_gg, gb / t_gg,
+                k512 ? "AVX512" : k256 ? "AVX2" : "dispatched", t_own, gb / t_own, t_gg / t_own, gb / t_rd);
     std::printf("  results: %ld of %ld differ in bits, worst |x-y|/|x| %.2e, %ld beyond 1e-5\n", differ, (long) nt * rows, worst, bad);
     std::printf("  vs a double reference on %d sampled rows: worst %.2e of the L1 norm (tol 1e-5); |x-y| max %.2e of |x| max %.2e\n",
                 sampled, worst_ref, absdiff, absmax);

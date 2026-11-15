@@ -194,6 +194,11 @@ static bool want_512(int type, int nt) {
     //  anything else with AVX-512 (Intel): not measured, so the AVX2 rows
     const int fam = amd_family();
     if (fam < 0x19) return false;
+    // IQ1_S: Ryzen 9 9950X (Zen 5), 15 threads, 3072 MB, ds4_gg_bench --exact --k512:
+    // 1 token 49.6 -> 54.0 GB/s (repeat 45.5 -> 52.9, seed 1: 49.3 -> 53.1); 2 tokens 22.3 -> 43.8;
+    // 4 tokens 12.2 -> 37.1. --expert: 1 token 45.8 -> 50.1 GB/s, all outputs bit-identical.
+    // No AVX2 IQ1_S rows or other CPU families were measured, so they keep ggml's dot.
+    if (type == 19) return fam == 0x1A;
     if (type == 16 || type == 17) return true;
     if (type == 18) return nt >= 2;
     if (type == 29) return nt >= 2 || fam >= 0x1A;

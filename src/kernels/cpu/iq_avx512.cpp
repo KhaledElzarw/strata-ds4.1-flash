@@ -6,8 +6,8 @@
 // `maddubs` and a `madd`.  The arithmetic is ggml's (ggml-cpu/quants.c, the `_generic` references): integer sums
 // per block, times d_x * d_y * the format's constant - only the order of the float additions differs.
 //
-// Formats: IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ3_S (21), IQ2_S (22).  IQ1_M stays on ggml-cpu (no shipped
-// model has IQ1_M expert rows: the 'Coder IQ1_M' pack's gate/up are IQ2_S / IQ3_XXS / IQ3_S).
+// Formats: IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ3_S (21), IQ2_S (22). The exact DeepSeek rows below also
+// support IQ1_S (19) and IQ1_M (29), with each format's separate delta accumulation.
 #include "strata/kernels/cpu/iq_avx512.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
@@ -508,6 +508,78 @@ void dot_rows_x_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void
 }
 
 
+// ---- IQ1_S (19): keep ggml's eight FMA lanes and its separate, non-fused scalar delta accumulator.
+// Each 64-value decode is shared by all tokens; the delta uses Q8_K's existing 16-value sums.
+inline int hsum8_i32(__m256i x) {
+    __m128i s = _mm_add_epi32(_mm256_castsi256_si128(x), _mm256_extracti128_si256(x, 1));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(1, 0, 3, 2)));
+    return _mm_cvtsi128_si32(_mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(2, 3, 0, 1))));
+}
+
+template <int NT>
+void rows_s(const uint8_t* w, size_t rb, int n, const void* const* act, float* const* out, int r0, int r1) {
+    const block_q8_K* y[NT];
+    for (int t = 0; t < NT; ++t) y[t] = (const block_q8_K*) act[t];
+    const __m512i zero = _mm512_setzero_si512();
+    const __m128i one = _mm_set1_epi16(1);
+    for (int r = r0; r < r1; ++r) {
+        __m256 acc[NT];
+        float delta[NT]{};
+        for (int t = 0; t < NT; ++t) acc[t] = _mm256_setzero_ps();
+        for (int i = 0; i < n / QK_K; ++i) {
+            const uint8_t* b = w + (size_t) r * rb + (size_t) i * sizeof(block_iq1_s);
+            if (prefetch_ahead > 0) _mm_prefetch((const char*) b + prefetch_ahead, _MM_HINT_T0);
+            const __m128i qh = _mm_loadu_si128((const __m128i*) (b + 34));
+            const __m128i scales = _mm_add_epi16(one, _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh, 12), _mm_set1_epi16(7)), 1));
+            const __m128i signed_sc = _mm_sign_epi16(scales, _mm_or_si128(_mm_srai_epi16(qh, 15), one));
+            const __m256i ds = _mm256_cvtepu16_epi32(signed_sc);
+            const __m256i delta_sc = _mm256_or_si256(ds, _mm256_slli_epi32(ds, 16));
+            __m512i sumi[NT];
+            for (int t = 0; t < NT; ++t) sumi[t] = zero;
+            for (int j = 0; j < 4; ++j) {
+                const uint8_t* qs = b + 2 + 8 * j;
+                const uint16_t h0 = u16(b + 34 + 4 * j), h1 = u16(b + 36 + 4 * j);
+                const __m512i g = _mm512_set_epi64(
+                    (long long) iq1s_grid[qs[7] | ((h1 >> 1) & 0x700)], (long long) iq1s_grid[qs[6] | ((h1 << 2) & 0x700)],
+                    (long long) iq1s_grid[qs[5] | ((h1 << 5) & 0x700)], (long long) iq1s_grid[qs[4] | ((h1 << 8) & 0x700)],
+                    (long long) iq1s_grid[qs[3] | ((h0 >> 1) & 0x700)], (long long) iq1s_grid[qs[2] | ((h0 << 2) & 0x700)],
+                    (long long) iq1s_grid[qs[1] | ((h0 << 5) & 0x700)], (long long) iq1s_grid[qs[0] | ((h0 << 8) & 0x700)]);
+                const __m512i sc = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_set1_epi16((short) (2 * ((h0 >> 12) & 7) + 1))),
+                                                    _mm256_set1_epi16((short) (2 * ((h1 >> 12) & 7) + 1)), 1);
+                const __m512i ag = _mm512_abs_epi8(g);
+                const __mmask64 neg = _mm512_movepi8_mask(g);
+                for (int t = 0; t < NT; ++t) {
+                    const __m512i q8 = _mm512_loadu_si512((const void*) (y[t][i].qs + 64 * j));
+                    const __m512i ys = _mm512_mask_sub_epi8(q8, neg, zero, q8);
+                    sumi[t] = _mm512_dpwssd_epi32(sumi[t], _mm512_maddubs_epi16(ag, ys), sc);
+                }
+            }
+            const float dx = h2f(u16(b));
+            for (int t = 0; t < NT; ++t) {
+                const float d = y[t][i].d * dx;
+                acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(fold256(sumi[t])), acc[t]);
+                const int corr = hsum8_i32(_mm256_madd_epi16(_mm256_loadu_si256((const __m256i*) y[t][i].bsums), delta_sc));
+                // ggml uses a rounded multiply followed by a rounded add here, unlike the main FMA lanes.
+                delta[t] = _mm_cvtss_f32(_mm_add_ss(_mm_set_ss(delta[t]), _mm_mul_ss(_mm_set_ss(d), _mm_set_ss((float) corr))));
+            }
+        }
+        for (int t = 0; t < NT; ++t) out[t][r] = hsum8_ggml(acc[t]) + IQ1S_DELTA * delta[t];
+    }
+}
+
+void rows_s_nt(int nt, const uint8_t* w, size_t rb, int n, const void* const* act, float* const* out, int r0, int r1) {
+    for (int t0 = 0; t0 < nt; t0 += 6) {
+        switch (nt - t0 < 6 ? nt - t0 : 6) {
+            case 1: rows_s<1>(w, rb, n, act + t0, out + t0, r0, r1); break;
+            case 2: rows_s<2>(w, rb, n, act + t0, out + t0, r0, r1); break;
+            case 3: rows_s<3>(w, rb, n, act + t0, out + t0, r0, r1); break;
+            case 4: rows_s<4>(w, rb, n, act + t0, out + t0, r0, r1); break;
+            case 5: rows_s<5>(w, rb, n, act + t0, out + t0, r0, r1); break;
+            default: rows_s<6>(w, rb, n, act + t0, out + t0, r0, r1); break;
+        }
+    }
+}
+
 // ---- IQ1_M (29), AVX-512, 1..6 tokens: ggml's dot lane for lane.  The grid indices come out of two pdep (as ggml's BMI2 path), the
 // +-1 delta signs out of one pext into an 8-bit mask a 64-value step; the signed grid bytes are split into |g| and a negative mask;
 // the delta dot is the pair sums of the activation (made once a call) times +-scale.  d is f16 in the top nibbles of the scales.
@@ -668,7 +740,7 @@ static bool has_vpopcnt() {
 bool iq512_gather_on() noexcept { return gather; }
 
 bool iq512x_supported(int type) noexcept {
-    return has_vpopcnt() && (type == 16 || type == 17 || type == 18 || type == 21 || type == 22 || type == 29);
+    return type == 19 || (has_vpopcnt() && (type == 16 || type == 17 || type == 18 || type == 21 || type == 22 || type == 29));
 }
 
 void iq512x_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
@@ -677,6 +749,7 @@ void iq512x_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void
         case 16: dot_rows_x_nt<16>(nt, w, row_bytes, n, act, out, r0, r1); break;
         case 17: dot_rows_x_nt<17>(nt, w, row_bytes, n, act, out, r0, r1); break;
         case 18: dot_rows_x_nt<18>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 19: rows_s_nt(nt, w, row_bytes, n, act, out, r0, r1); break;
         case 21: dot_rows_x_nt<21>(nt, w, row_bytes, n, act, out, r0, r1); break;
         case 22: dot_rows_x_nt<22>(nt, w, row_bytes, n, act, out, r0, r1); break;
         case 23: dot_rows_x_nt<23>(nt, w, row_bytes, n, act, out, r0, r1); break;
