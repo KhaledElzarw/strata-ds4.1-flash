@@ -1,0 +1,94 @@
+{
+ "cmd": [
+  "C:/src/Strata/build-dsv41/strata-dsv41.exe",
+  "--pack",
+  "C:/models/DSV41-IQ1_M/pack",
+  "--gpus",
+  "0",
+  "--max-context",
+  "65536",
+  "--dspark",
+  "auto",
+  "--serve"
+ ],
+ "load_s": 21.750309944152832,
+ "rows": [
+  {
+   "round": 1,
+   "id": "code_lru",
+   "prompt_tokens": 30,
+   "gen": 384,
+   "prompt_ms": 987.0,
+   "decode_ms": 16555.2,
+   "decode_tps": 23.19512902290519,
+   "prompt_tps": 30.3951367781155,
+   "done": "DONE 384 30 987.0 16555.2 length 0 0 0 0 0"
+  },
+  {
+   "round": 1,
+   "id": "code_parse",
+   "prompt_tokens": 54,
+   "gen": 384,
+   "prompt_ms": 1417.7,
+   "decode_ms": 14335.3,
+   "decode_tps": 26.787022245784883,
+   "prompt_tps": 38.089863864005075,
+   "done": "DONE 384 54 1417.7 14335.3 length 0 0 0 0 0"
+  },
+  {
+   "round": 1,
+   "id": "agent_review",
+   "prompt_tokens": 2787,
+   "gen": 384,
+   "prompt_ms": 10099.3,
+   "decode_ms": 17120.0,
+   "decode_tps": 22.429906542056074,
+   "prompt_tps": 275.95971998059275,
+   "done": "DONE 384 2787 10099.3 17120.0 length 0 0 0 0 0"
+  },
+  {
+   "round": 1,
+   "id": "agent_rewrite",
+   "prompt_tokens": 947,
+   "gen": 384,
+   "prompt_ms": 5379.0,
+   "decode_ms": 16964.4,
+   "decode_tps": 22.635636980971917,
+   "prompt_tps": 176.055028815765,
+   "done": "DONE 384 947 5379.0 16964.4 length 0 0 0 0 0"
+  },
+  {
+   "round": 1,
+   "id": "prose_moe",
+   "prompt_tokens": 38,
+   "gen": 253,
+   "prompt_ms": 1335.6,
+   "decode_ms": 11352.9,
+   "decode_tps": 22.28505491988831,
+   "prompt_tps": 28.451632225217132,
+   "done": "DONE 253 38 1335.6 11352.9 stop 0 0 0 0 0"
+  },
+  {
+   "round": 1,
+   "id": "prose_story",
+   "prompt_tokens": 28,
+   "gen": 383,
+   "prompt_ms": 992.6,
+   "decode_ms": 19597.7,
+   "decode_tps": 19.543109650622267,
+   "prompt_tps": 28.208744710860366,
+   "done": "DONE 383 28 992.6 19597.7 stop 0 0 0 0 0"
+  },
+  {
+   "round": 1,
+   "id": "long_summary",
+   "prompt_tokens": 14504,
+   "gen": 256,
+   "prompt_ms": 20711.2,
+   "decode_ms": 11518.0,
+   "decode_tps": 22.226080916825836,
+   "prompt_tps": 700.2974236162077,
+   "done": "DONE 256 14504 20711.2 11518.0 length 0 0 0 0 0"
+  }
+ ]
+}

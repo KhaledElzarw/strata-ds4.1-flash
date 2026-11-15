@@ -1,0 +1,250 @@
+{
+ "cmd": [
+  "C:/src/Strata/build-dsv41/strata-dsv41.exe",
+  "--pack",
+  "C:/models/DSV41-IQ1_M/pack",
+  "--gpus",
+  "0",
+  "--max-context",
+  "65536",
+  "--dspark",
+  "on",
+  "--dspark-conf",
+  "0.65",
+  "--serve"
+ ],
+ "load_s": 22.291281700134277,
+ "rows": [
+  {
+   "round": 1,
+   "id": "code_lru",
+   "prompt_tokens": 30,
+   "gen": 384,
+   "prompt_ms": 2109.4,
+   "decode_ms": 18031.0,
+   "decode_tps": 21.29665575952526,
+   "prompt_tps": 14.22205366454916,
+   "done": "DONE 384 30 2109.4 18031.0 length 291 339 0 0 0"
+  },
+  {
+   "round": 1,
+   "id": "code_parse",
+   "prompt_tokens": 54,
+   "gen": 384,
+   "prompt_ms": 2004.4,
+   "decode_ms": 16842.6,
+   "decode_tps": 22.79933026967333,
+   "prompt_tps": 26.9407303931351,
+   "done": "DONE 384 54 2004.4 16842.6 length 282 319 0 0 0"
+  },
+  {
+   "round": 1,
+   "id": "agent_review",
+   "prompt_tokens": 2787,
+   "gen": 384,
+   "prompt_ms": 9564.2,
+   "decode_ms": 19386.5,
+   "decode_tps": 19.80759807082248,
+   "prompt_tps": 291.39917609418455,
+   "done": "DONE 384 2787 9564.2 19386.5 length 244 296 0 0 0"
+  },
+  {
+   "round": 1,
+   "id": "agent_rewrite",
+   "prompt_tokens": 947,
+   "gen": 384,
+   "prompt_ms": 6138.3,
+   "decode_ms": 16750.6,
+   "decode_tps": 22.924551956347834,
+   "prompt_tps": 154.27724288483782,
+   "done": "DONE 384 947 6138.3 16750.6 length 301 317 0 0 0"
+  },
+  {
+   "round": 1,
+   "id": "prose_moe",
+   "prompt_tokens": 38,
+   "gen": 310,
+   "prompt_ms": 1946.6,
+   "decode_ms": 17188.4,
+   "decode_tps": 18.03541923622908,
+   "prompt_tps": 19.521216480016438,
+   "done": "DONE 310 38 1946.6 17188.4 stop 104 124 0 0 0"
+  },
+  {
+   "round": 1,
+   "id": "prose_story",
+   "prompt_tokens": 28,
+   "gen": 381,
+   "prompt_ms": 1127.8,
+   "decode_ms": 21213.4,
+   "decode_tps": 17.960345819152042,
+   "prompt_tps": 24.82709700301472,
+   "done": "DONE 381 28 1127.8 21213.4 stop 68 75 0 0 0"
+  },
+  {
+   "round": 1,
+   "id": "long_summary",
+   "prompt_tokens": 14504,
+   "gen": 256,
+   "prompt_ms": 20402.3,
+   "decode_ms": 13207.9,
+   "decode_tps": 19.382339357505735,
+   "prompt_tps": 710.900241639423,
+   "done": "DONE 256 14504 20402.3 13207.9 length 151 174 0 0 0"
+  },
+  {
+   "round": 2,
+   "id": "code_lru",
+   "prompt_tokens": 30,
+   "gen": 384,
+   "prompt_ms": 1275.7,
+   "decode_ms": 16925.5,
+   "decode_tps": 22.687660630409738,
+   "prompt_tps": 23.51650074468919,
+   "done": "DONE 384 30 1275.7 16925.5 length 291 327 0 0 0"
+  },
+  {
+   "round": 2,
+   "id": "code_parse",
+   "prompt_tokens": 54,
+   "gen": 384,
+   "prompt_ms": 2015.1,
+   "decode_ms": 16859.7,
+   "decode_tps": 22.776205982312852,
+   "prompt_tps": 26.79767753461367,
+   "done": "DONE 384 54 2015.1 16859.7 length 286 332 0 0 0"
+  },
+  {
+   "round": 2,
+   "id": "agent_review",
+   "prompt_tokens": 2787,
+   "gen": 384,
+   "prompt_ms": 8753.8,
+   "decode_ms": 18271.4,
+   "decode_tps": 21.016451941285286,
+   "prompt_tps": 318.3760195572209,
+   "done": "DONE 384 2787 8753.8 18271.4 length 243 267 0 0 0"
+  },
+  {
+   "round": 2,
+   "id": "agent_rewrite",
+   "prompt_tokens": 947,
+   "gen": 384,
+   "prompt_ms": 5824.7,
+   "decode_ms": 16310.7,
+   "decode_tps": 23.5428277143225,
+   "prompt_tps": 162.5834806942847,
+   "done": "DONE 384 947 5824.7 16310.7 length 303 308 0 0 0"
+  },
+  {
+   "round": 2,
+   "id": "prose_moe",
+   "prompt_tokens": 38,
+   "gen": 279,
+   "prompt_ms": 1914.1,
+   "decode_ms": 15775.6,
+   "decode_tps": 17.685539694211315,
+   "prompt_tps": 19.852672274175855,
+   "done": "DONE 279 38 1914.1 15775.6 stop 82 102 0 0 0"
+  },
+  {
+   "round": 2,
+   "id": "prose_story",
+   "prompt_tokens": 28,
+   "gen": 381,
+   "prompt_ms": 1142.3,
+   "decode_ms": 21177.1,
+   "decode_tps": 17.99113193024541,
+   "prompt_tps": 24.51194957541802,
+   "done": "DONE 381 28 1142.3 21177.1 stop 68 75 0 0 0"
+  },
+  {
+   "round": 2,
+   "id": "long_summary",
+   "prompt_tokens": 14504,
+   "gen": 256,
+   "prompt_ms": 17924.1,
+   "decode_ms": 12731.2,
+   "decode_tps": 20.10808093502576,
+   "prompt_tps": 809.18986169459,
+   "done": "DONE 256 14504 17924.1 12731.2 length 153 170 0 0 0"
+  },
+  {
+   "round": 3,
+   "id": "code_lru",
+   "prompt_tokens": 30,
+   "gen": 384,
+   "prompt_ms": 1255.2,
+   "decode_ms": 16871.9,
+   "decode_tps": 22.75973660346493,
+   "prompt_tps": 23.90057361376673,
+   "done": "DONE 384 30 1255.2 16871.9 length 291 327 0 0 0"
+  },
+  {
+   "round": 3,
+   "id": "code_parse",
+   "prompt_tokens": 54,
+   "gen": 384,
+   "prompt_ms": 1976.0,
+   "decode_ms": 16809.0,
+   "decode_tps": 22.84490451543816,
+   "prompt_tps": 27.327935222672064,
+   "done": "DONE 384 54 1976.0 16809.0 length 286 332 0 0 0"
+  },
+  {
+   "round": 3,
+   "id": "agent_review",
+   "prompt_tokens": 2787,
+   "gen": 384,
+   "prompt_ms": 8738.2,
+   "decode_ms": 18305.8,
+   "decode_tps": 20.976958122562248,
+   "prompt_tps": 318.94440502620677,
+   "done": "DONE 384 2787 8738.2 18305.8 length 245 271 0 0 0"
+  },
+  {
+   "round": 3,
+   "id": "agent_rewrite",
+   "prompt_tokens": 947,
+   "gen": 384,
+   "prompt_ms": 5962.4,
+   "decode_ms": 16871.8,
+   "decode_tps": 22.759871501558816,
+   "prompt_tps": 158.82865960016102,
+   "done": "DONE 384 947 5962.4 16871.8 length 302 316 0 0 0"
+  },
+  {
+   "round": 3,
+   "id": "prose_moe",
+   "prompt_tokens": 38,
+   "gen": 279,
+   "prompt_ms": 1923.8,
+   "decode_ms": 15765.9,
+   "decode_tps": 17.696420756188992,
+   "prompt_tps": 19.752573032539765,
+   "done": "DONE 279 38 1923.8 15765.9 stop 82 102 0 0 0"
+  },
+  {
+   "round": 3,
+   "id": "prose_story",
+   "prompt_tokens": 28,
+   "gen": 381,
+   "prompt_ms": 1113.0,
+   "decode_ms": 21118.7,
+   "decode_tps": 18.040883198302925,
+   "prompt_tps": 25.157232704402517,
+   "done": "DONE 381 28 1113.0 21118.7 stop 68 75 0 0 0"
+  },
+  {
+   "round": 3,
+   "id": "long_summary",
+   "prompt_tokens": 14504,
+   "gen": 256,
+   "prompt_ms": 17922.1,
+   "decode_ms": 12491.1,
+   "decode_tps": 20.494592149610522,
+   "prompt_tps": 809.2801624809593,
+   "done": "DONE 256 14504 17922.1 12491.1 length 154 171 0 0 0"
+  }
+ ]
+}

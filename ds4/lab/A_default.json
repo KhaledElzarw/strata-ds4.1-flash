@@ -1,0 +1,248 @@
+{
+ "cmd": [
+  "C:/src/Strata/build-dsv41/strata-dsv41.exe",
+  "--pack",
+  "C:/models/DSV41-IQ1_M/pack",
+  "--gpus",
+  "0",
+  "--max-context",
+  "65536",
+  "--dspark",
+  "auto",
+  "--serve"
+ ],
+ "load_s": 22.36700129508972,
+ "rows": [
+  {
+   "round": 1,
+   "id": "code_lru",
+   "prompt_tokens": 30,
+   "gen": 384,
+   "prompt_ms": 1054.3,
+   "decode_ms": 20352.6,
+   "decode_tps": 18.86736829692521,
+   "prompt_tps": 28.454898985108603,
+   "done": "DONE 384 30 1054.3 20352.6 length 0 0 0 0 0"
+  },
+  {
+   "round": 1,
+   "id": "code_parse",
+   "prompt_tokens": 54,
+   "gen": 384,
+   "prompt_ms": 1451.5,
+   "decode_ms": 14818.3,
+   "decode_tps": 25.913903754141838,
+   "prompt_tps": 37.20289355838788,
+   "done": "DONE 384 54 1451.5 14818.3 length 0 0 0 0 0"
+  },
+  {
+   "round": 1,
+   "id": "agent_review",
+   "prompt_tokens": 2787,
+   "gen": 384,
+   "prompt_ms": 10111.0,
+   "decode_ms": 17192.6,
+   "decode_tps": 22.335190721589523,
+   "prompt_tps": 275.6403916526555,
+   "done": "DONE 384 2787 10111.0 17192.6 length 0 0 0 0 0"
+  },
+  {
+   "round": 1,
+   "id": "agent_rewrite",
+   "prompt_tokens": 947,
+   "gen": 384,
+   "prompt_ms": 5566.7,
+   "decode_ms": 17103.4,
+   "decode_tps": 22.45167627489271,
+   "prompt_tps": 170.1187418039413,
+   "done": "DONE 384 947 5566.7 17103.4 length 0 0 0 0 0"
+  },
+  {
+   "round": 1,
+   "id": "prose_moe",
+   "prompt_tokens": 38,
+   "gen": 277,
+   "prompt_ms": 1393.8,
+   "decode_ms": 12956.7,
+   "decode_tps": 21.37890049163753,
+   "prompt_tps": 27.263595924809874,
+   "done": "DONE 277 38 1393.8 12956.7 stop 0 0 0 0 0"
+  },
+  {
+   "round": 1,
+   "id": "prose_story",
+   "prompt_tokens": 28,
+   "gen": 313,
+   "prompt_ms": 984.0,
+   "decode_ms": 16602.6,
+   "decode_tps": 18.852468890414755,
+   "prompt_tps": 28.45528455284553,
+   "done": "DONE 313 28 984.0 16602.6 stop 0 0 0 0 0"
+  },
+  {
+   "round": 1,
+   "id": "long_summary",
+   "prompt_tokens": 14504,
+   "gen": 256,
+   "prompt_ms": 20863.7,
+   "decode_ms": 11569.8,
+   "decode_tps": 22.126570900101992,
+   "prompt_tps": 695.1787075159248,
+   "done": "DONE 256 14504 20863.7 11569.8 length 0 0 0 0 0"
+  },
+  {
+   "round": 2,
+   "id": "code_lru",
+   "prompt_tokens": 30,
+   "gen": 384,
+   "prompt_ms": 849.0,
+   "decode_ms": 16823.2,
+   "decode_tps": 22.825621760426078,
+   "prompt_tps": 35.3356890459364,
+   "done": "DONE 384 30 849.0 16823.2 length 0 0 0 0 0"
+  },
+  {
+   "round": 2,
+   "id": "code_parse",
+   "prompt_tokens": 54,
+   "gen": 384,
+   "prompt_ms": 1271.5,
+   "decode_ms": 14595.7,
+   "decode_tps": 26.309118438992304,
+   "prompt_tps": 42.469524184034604,
+   "done": "DONE 384 54 1271.5 14595.7 length 0 0 0 0 0"
+  },
+  {
+   "round": 2,
+   "id": "agent_review",
+   "prompt_tokens": 2787,
+   "gen": 384,
+   "prompt_ms": 8019.1,
+   "decode_ms": 16076.2,
+   "decode_tps": 23.88624177355345,
+   "prompt_tps": 347.5452357496477,
+   "done": "DONE 384 2787 8019.1 16076.2 length 0 0 0 0 0"
+  },
+  {
+   "round": 2,
+   "id": "agent_rewrite",
+   "prompt_tokens": 947,
+   "gen": 384,
+   "prompt_ms": 4686.4,
+   "decode_ms": 16609.4,
+   "decode_tps": 23.1194383903091,
+   "prompt_tps": 202.07408671901675,
+   "done": "DONE 384 947 4686.4 16609.4 length 0 0 0 0 0"
+  },
+  {
+   "round": 2,
+   "id": "prose_moe",
+   "prompt_tokens": 38,
+   "gen": 291,
+   "prompt_ms": 1338.4,
+   "decode_ms": 13313.0,
+   "decode_tps": 21.858333959287915,
+   "prompt_tps": 28.39210998206814,
+   "done": "DONE 291 38 1338.4 13313.0 stop 0 0 0 0 0"
+  },
+  {
+   "round": 2,
+   "id": "prose_story",
+   "prompt_tokens": 28,
+   "gen": 335,
+   "prompt_ms": 987.7,
+   "decode_ms": 17789.8,
+   "decode_tps": 18.83101552575071,
+   "prompt_tps": 28.348688873139615,
+   "done": "DONE 335 28 987.7 17789.8 stop 0 0 0 0 0"
+  },
+  {
+   "round": 2,
+   "id": "long_summary",
+   "prompt_tokens": 14504,
+   "gen": 256,
+   "prompt_ms": 17889.1,
+   "decode_ms": 11705.5,
+   "decode_tps": 21.870061082397164,
+   "prompt_tps": 810.773040566602,
+   "done": "DONE 256 14504 17889.1 11705.5 length 0 0 0 0 0"
+  },
+  {
+   "round": 3,
+   "id": "code_lru",
+   "prompt_tokens": 30,
+   "gen": 384,
+   "prompt_ms": 874.4,
+   "decode_ms": 16558.0,
+   "decode_tps": 23.191206667471917,
+   "prompt_tps": 34.3092406221409,
+   "done": "DONE 384 30 874.4 16558.0 length 0 0 0 0 0"
+  },
+  {
+   "round": 3,
+   "id": "code_parse",
+   "prompt_tokens": 54,
+   "gen": 384,
+   "prompt_ms": 1324.0,
+   "decode_ms": 14694.5,
+   "decode_tps": 26.13222634318963,
+   "prompt_tps": 40.78549848942598,
+   "done": "DONE 384 54 1324.0 14694.5 length 0 0 0 0 0"
+  },
+  {
+   "round": 3,
+   "id": "agent_review",
+   "prompt_tokens": 2787,
+   "gen": 384,
+   "prompt_ms": 7926.4,
+   "decode_ms": 16091.8,
+   "decode_tps": 23.863085546675947,
+   "prompt_tps": 351.60981025433995,
+   "done": "DONE 384 2787 7926.4 16091.8 length 0 0 0 0 0"
+  },
+  {
+   "round": 3,
+   "id": "agent_rewrite",
+   "prompt_tokens": 947,
+   "gen": 384,
+   "prompt_ms": 4685.6,
+   "decode_ms": 16500.8,
+   "decode_tps": 23.27159895277805,
+   "prompt_tps": 202.1085880143418,
+   "done": "DONE 384 947 4685.6 16500.8 length 0 0 0 0 0"
+  },
+  {
+   "round": 3,
+   "id": "prose_moe",
+   "prompt_tokens": 38,
+   "gen": 309,
+   "prompt_ms": 1342.9,
+   "decode_ms": 13987.4,
+   "decode_tps": 22.091310751104565,
+   "prompt_tps": 28.29696924566237,
+   "done": "DONE 309 38 1342.9 13987.4 stop 0 0 0 0 0"
+  },
+  {
+   "round": 3,
+   "id": "prose_story",
+   "prompt_tokens": 28,
+   "gen": 384,
+   "prompt_ms": 992.1,
+   "decode_ms": 20034.7,
+   "decode_tps": 19.166745696217063,
+   "prompt_tps": 28.22296139502066,
+   "done": "DONE 384 28 992.1 20034.7 length 0 0 0 0 0"
+  },
+  {
+   "round": 3,
+   "id": "long_summary",
+   "prompt_tokens": 14504,
+   "gen": 256,
+   "prompt_ms": 17849.8,
+   "decode_ms": 11377.1,
+   "decode_tps": 22.501340411880005,
+   "prompt_tps": 812.5581239005479,
+   "done": "DONE 256 14504 17849.8 11377.1 length 0 0 0 0 0"
+  }
+ ]
+}
