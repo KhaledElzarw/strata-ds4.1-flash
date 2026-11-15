@@ -254,6 +254,28 @@ public:
                               std::memory_order_relaxed);
         return all;
     }
+    /// Waits until one of the slots sl[i], i in `cand`, has its reads done and returns that i (the first such in `cand`'s
+    /// order); at once for one with no slot (the caller's wait_slots reports it).  -1 if `cand` is empty.
+    int wait_any_loaded(const std::vector<int>& sl, const std::vector<int>& cand) {
+        if (cand.empty()) return -1;
+        const auto t0 = std::chrono::steady_clock::now();
+        int got = -1;
+        for (;;) {
+            const uint64_t seen = io_->done_seen();
+            for (const int i : cand) {
+                const int s = sl[(size_t) i];
+                if (s < 0 || slots_[(size_t) s].left.load(std::memory_order_acquire) <= 0) {
+                    got = i;
+                    break;
+                }
+            }
+            if (got >= 0) break;
+            io_->wait_change(seen, 2000);
+        }
+        st_.wait_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(),
+                              std::memory_order_relaxed);
+        return got;
+    }
     void release(int layer, const int* es, int n, const std::vector<char>& ok) {
         if (layer < 0 || layer >= (int) geo_.size()) return;
         std::lock_guard<std::mutex> lk(mu_);
@@ -269,7 +291,10 @@ public:
         if (where_[(size_t) layer][(size_t) e] >= 0) return;
         std::lock_guard<std::mutex> lk(mu_);
         if (where_[(size_t) layer][(size_t) e] >= 0) return;
-        if (start_fill(layer, e, false) >= 0) st_.prefetched.fetch_add(1, std::memory_order_relaxed);
+        if (start_fill(layer, e, false) >= 0) {
+            st_.prefetched.fetch_add(1, std::memory_order_relaxed);
+            guessed_.store(true, std::memory_order_relaxed);
+        }
     }
     /// Reads the experts of `list` (layer, expert; hottest first) into free slots and returns when they are in (a start that
     /// is already warm: the profile's hottest, so the first tokens find them).  The first `list.size()` fit the arena less
@@ -397,6 +422,7 @@ public:
     }
     /// Guesses still waiting in the queue for a layer the token is past: dropped unread (their slots free once the queue has gone by)
     void cancel_stale(int layer_now) {
+        if (!guessed_.load(std::memory_order_relaxed)) return;   // (no guess ever started: no slot is a guess - preload clears its own)
         std::lock_guard<std::mutex> lk(mu_);
         for (size_t i = 0; i < nmax_; ++i) {
             Slot& sp = slots_[i];
@@ -712,6 +738,7 @@ private:
     std::vector<std::vector<float>> heat_;
     std::vector<uint64_t> hits_in_layer_;
     uint64_t clock_ = 0;
+    std::atomic<bool> guessed_{false};   // (prefetch() started a read once)
     std::mutex mu_;
     std::unique_ptr<IoQueue> io_;
     Stats st_;

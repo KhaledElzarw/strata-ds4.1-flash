@@ -1609,7 +1609,8 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
                                                             float route_scale, const unsigned long long* __restrict__ vram,
                                                             const float* __restrict__ x, int dim, int* idx, float* w,
                                                             unsigned long long* plan_ptr, Req* req,
-                                                            const float* __restrict__ bias_vl, unsigned vl) {
+                                                            const float* __restrict__ bias_vl, unsigned vl,
+                                                            unsigned seq, int na0, int na1) {
     __shared__ float sc[1024], bs[1024];
     __shared__ float bv[32];
     __shared__ int bi[32];
@@ -1671,6 +1672,19 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
     __syncthreads();
     if (req != nullptr && on_cpu)
         for (int i = threadIdx.x; i < dim; i += blockDim.x) req->x[t][i] = x[(size_t) t * dim + i];
+    // one token (one block): publish_kernel's job here, a launch less a layer - every thread's req writes fenced
+    // system-wide before the barrier, then the request's seq last (as publish_kernel orders them)
+    if (req != nullptr && gridDim.x == 1) {
+        __threadfence_system();
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            req->na[0] = na0;
+            req->na[1] = na1;
+            req->T = 1;
+            __threadfence_system();
+            *(volatile unsigned*) &req->seq = seq;
+        }
+    }
 }
 
 // a later layer's m likely picks (route_kernel's choice from its logits) into req->ahead[t][off ..)
@@ -2155,8 +2169,8 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
     }
 #endif
     strata_ds4_launch(route_publish_kernel, T, 512, 0, s, logits, bias, n, k, route_scale, vram, x, dim, idx, w, plan_ptr, req,
-                                           vl != 0 ? bias_vl : nullptr, vl);
-    if (req != nullptr) strata_ds4_launch(publish_kernel, 1, 1, 0, s, req, T, seq, na0, na1);
+                                           vl != 0 ? bias_vl : nullptr, vl, seq, na0, na1);
+    if (req != nullptr && T > 1) strata_ds4_launch(publish_kernel, 1, 1, 0, s, req, T, seq, na0, na1);   // (T == 1: fused above)
 }
 void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s) {
 #if defined(STRATA_METAL)

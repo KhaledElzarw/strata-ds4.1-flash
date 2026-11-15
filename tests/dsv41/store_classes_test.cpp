@@ -279,6 +279,44 @@ void guesses_and_put(const Fixture& f) {
     std::printf("PASS deterministic prefetch/cancel_stale, begin/loaded/partial waits, put success/failure across classes\n");
 }
 
+void wait_any(const Fixture& f) {
+    ExpertStore s;
+    auto c = f.cfg();
+    c.threads = 1;
+    f.init(s, c, false);
+    OpenGateOnExit cleanup;
+    s.cancel_stale(3); // no guess ever started: nothing to cancel
+    check(s.stats().cancelled.load() == 0, "cancel_stale without guesses");
+    std::vector<int> es{40, 41}, slots;
+    std::vector<char> ok;
+    gate.arm();
+    s.begin(1, es.data(), (int) es.size(), ok, slots);
+    gate.await(); // the first read blocked, the second queued behind it (one reader)
+    std::atomic<int> got{-2};
+    std::thread w([&] { got.store(s.wait_any_loaded(slots, {1, 0})); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    check(got.load() == -2, "wait_any_loaded returned before any read landed");
+    gate.open();
+    w.join();
+    check((got.load() == 0 || got.load() == 1) && s.loaded(slots[(size_t) got.load()]), "wait_any_loaded returned an unfinished slot");
+    check(s.wait_slots(slots, ok, 0, 2) && ok[0] && ok[1], "wait_slots after wait_any_loaded");
+    check(s.wait_any_loaded(slots, {1, 0}) == 1, "wait_any_loaded must keep the candidates' order");
+    const std::vector<int> none{-1, slots[0]};
+    check(s.wait_any_loaded(none, {0, 1}) == 0, "a candidate with no slot returns at once");
+    check(s.wait_any_loaded(slots, {}) == -1, "no candidates");
+    f.bytes(s, 1, es[0]);
+    f.bytes(s, 1, es[1]);
+    s.release(1, es.data(), (int) es.size(), ok);
+    gate.arm();
+    s.prefetch(3, 5); // a guess (its read held): cancel_stale scans again
+    gate.await();
+    s.cancel_stale(3);
+    gate.open();
+    s.preload({}, 0);
+    check(s.find(3, 5) < 0 && s.stats().cancelled.load() == 1, "cancel_stale after a guess");
+    std::printf("PASS wait_any_loaded (first landed, candidate order, no slot), cancel_stale with and without guesses\n");
+}
+
 void preload(const Fixture& f) {
     ExpertStore s;
     f.init(s, f.cfg());
@@ -516,6 +554,7 @@ int main(int argc, char** argv) {
         eviction(f, ExpertStore::kLru);
         eviction(f, ExpertStore::kLfu);
         guesses_and_put(f);
+        wait_any(f);
         preload(f);
         failed_read(f);
         mapping_and_shrink(f, true);

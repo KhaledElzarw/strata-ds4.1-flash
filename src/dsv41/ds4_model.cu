@@ -6886,7 +6886,9 @@ struct Model::Impl {
     void tune_lane() {
         if (o.cpu_threads > 0 || std::getenv("STRATA_DS4_CPU_LANE") != nullptr || pools.empty()) return;
         std::vector<LaneCfg> cfgs = lane_cfgs();
-        cfgs.erase(std::remove_if(cfgs.begin(), cfgs.end(), [](const LaneCfg& c) { return !c.measured; }), cfgs.end());
+        // (STRATA_DS4_LANE_MEASURE_ALL=1: the by-hand ones timed too - a host check; kLaneGain still decides)
+        static const bool all = std::getenv("STRATA_DS4_LANE_MEASURE_ALL") != nullptr;
+        cfgs.erase(std::remove_if(cfgs.begin(), cfgs.end(), [](const LaneCfg& c) { return !c.measured && !all; }), cfgs.end());
         if (cfgs.size() < 2) return;   // (one way on this host: nothing to measure)
         constexpr int kPer = 4, kSets = 6, kRounds = 5, kCalls = 8;
         int il = -1, most = 0;
@@ -8272,10 +8274,21 @@ struct Model::Impl {
             };
         run_nodes(ne * GB, f);
         double tr1 = now_ms(); if (cpulog) t_r1 += tr1 - tq1;
-        for (const Ent& en : ents)
-            for (int i = 0; i < en.n; ++i)
-                gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) (en.slot0 + i) * FF, FF,
-                                 aq + (size_t) (kWin + en.slot0 + i) * E * 4);
+        {   // each entry token's h quantized (one job each, on the lane's workers: the same bytes whichever thread)
+            int nq = 0;
+            int qs[kSlots];   // (distinct slots: at most kSlots)
+            for (const Ent& en : ents)
+                for (int i = 0; i < en.n; ++i) qs[nq++] = en.slot0 + i;
+            auto q2 = [&](int j) {
+                gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) qs[j] * FF, FF, aq + (size_t) (kWin + qs[j]) * E * 4);
+            };
+            if (nq < 2 || std::getenv("DS4_SERIAL_QUANT2") != nullptr)
+                for (int j = 0; j < nq; ++j) q2(j);
+            else {
+                for (int X = 0; X < NH; ++X) f[X] = X == 0 ? std::function<void(int)>(q2) : std::function<void(int)>([](int) {});
+                run_nodes(nq, f);
+            }
+        }
         double tq2 = now_ms(); if (cpulog) t_q2 += tq2 - tr1;
         for (int X = 0; X < NH; ++X)
             f[X] = [&, X](int j) {
@@ -8395,12 +8408,22 @@ struct Model::Impl {
                         pick = i;
                         break;
                     }
-                if (pick == cold.size())
+                if (pick == cold.size()) {   // none in yet: whichever lands first, not the first in the list
+                    std::vector<int> cand;
+                    std::vector<size_t> at;
                     for (size_t i = 0; i < cold.size(); ++i)
                         if (!done[i]) {
-                            pick = i;
+                            cand.push_back(hold.idx(cold[i].e));
+                            at.push_back(i);
+                        }
+                    const int h = hold.m->store->wait_any_loaded(hold.sl, cand);
+                    for (size_t q = 0; q < cand.size(); ++q)
+                        if (cand[q] == h) {
+                            pick = at[q];
                             break;
                         }
+                    if (pick == cold.size()) pick = at[0];
+                }
                 hold.wait_expert(cold[pick].e);
                 std::vector<Ent> one(1, cold[pick]);
                 cpu_experts_mx(l, x, one, ldx, nullptr);

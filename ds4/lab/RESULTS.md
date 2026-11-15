@@ -188,6 +188,30 @@ prompts are equal or faster with classes; pooled mean prompt time 1,866 vs 1,853
 r4's first round: GPU contention, and with the fixed 88 GB store free RAM fell to ~4 GB (so the launcher keeps sizing
 the store by the 6 GB headroom at load, not a fixed size).  Adopted: classes on by default.
 
+## The CPU lane's layout (screen2.sh s3 and tune_lane, 2026-11-16 01:38-02:09)
+
+A 256K knob screen (base, `STRATA_DS4_CPU_LANE=smt`, `STRATA_DS4_LANE_FREE=0`) could not judge it: on this CPU the lane
+takes 16 of 32 logical CPUs, so LANE_FREE does nothing and base vs free0 is an A/A pair, yet their round-2 medians
+differ by +20% (Unity took ~1.7 cores at times).  The engine's own load-time timer (tune_lane: the same 4-expert calls
+on each layout, best of 5 interleaved rounds), opened to the by-hand layouts with `STRATA_DS4_LANE_MEASURE_ALL=1`:
+cores (16 threads) 0.93 ms, smt (32) 1.10 ms - the siblings make the lane 18% slower.  The lane stays a thread a core.
+
+## Small exact CPU-lane items, batched (issue #7; ab.py runs/ab/exp-r6-256k.json, 2026-11-16 02:10-03:05)
+
+Four changes, each likely under 1 ms a token, A/B'd together: (1) `cancel_stale` returns before locking the store when
+no guess was ever started (guesses are off by default; it scanned all ~12,000 slots under the store lock every layer);
+(2) at one token the request's publish is done by the routing kernel itself, one launch less a layer; (3) when none of
+the store-read experts is in, the lane waits for whichever lands first, not the first in its list; (4) the second
+activation quantize runs one row a job on the lane's workers (DS4_SERIAL_QUANT2=1: serial).  Store test 13/13; token
+identity vs the previous exe 7/7 (idcheck b7).  Real turns at 256K, fixed `--ssd-cache 88`, split on, frozen profile:
+
+| Arm | medians by round | vs head, clean pairs | all pairs |
+|---|---|---|---|
+| head (1e4e082a) | 28.7, 29.5, 28.8 | | |
+| batch | 29.8, 29.6, 29.8 | +3.2% [1.8, 4.9], n 61 | +2.3% [0.9, 3.7], n 88 |
+
+Prompt time unchanged (paired 0.98x [0.94, 1.02]).  Adopted.
+
 ## Files
 
 bench_dsv41.py (driver), qcheck.sh (quality), idcheck.sh (identity), longab.sh (long prompts), ab.py/ab_clean.py (A/B), A_default.*, B_dspark.*, C_prof.log (profile), D_trace.bin (routing), cache_sim.py/.out, window_union.py, screen.sh, verify_copy.py/.log.
