@@ -31,6 +31,36 @@ VRAM hit rate 65.6% with 13% of the experts resident (static profile alone predi
 
 LRU ignores upload cost (optimistic); the sim's LFU is ~5 points above the engine's measured rate at 1x.
 
+## Knob screen (screen.sh, 2026-11-15 12:07-12:35, one load per arm, 7 prompts x 2 rounds)
+
+| Arm | Env | Round 2 median decode | vs base |
+|---|---|---|---|
+| base | DS4_IO_STATS=1 | 22.78 | - |
+| stream | DS4_STREAM=1 | 23.43 | +2.9% |
+| attnsplit | DS4_ATTN_SPLIT=1 | 23.36 | +2.5% |
+| cache_eager | DS4_CACHE_MARGIN=1.0 DS4_CACHE_BONUS=0 | 21.54 | -5.4% |
+| recent16 | DS4_RECENT=16 | 20.05 | -12.0% |
+
+Per-prompt spread inside an arm is 19-26 tok/s, so +2.5-3% is inside the noise: stream and attnsplit need an interleaved
+A/B with more rounds before either is called a win. With DS4_STREAM=1 the engine times streaming against the CPU lane in
+decode and stops streaming requests whose experts are all in RAM (2.91 vs 0.57 ms, +414%), so it mostly turns itself off.
+The serve line's "CPU lane x% of the experts" is cumulative since load (prompt picks included), not per request.
+DS4_IO_STATS prints totals at exit for load + prompts + decode together, so it can't isolate decode-time disk reads.
+
+## Draft windows: what a T-token window reads (window_union.py over D_trace.bin, LRU cache of 2,059)
+
+| T | CPU-lane experts vs one token | all distinct picks vs one token |
+|---|---|---|
+| 1 | 1.00x (60.1) | 1.00x (240) |
+| 2 | 1.97x | 1.69x |
+| 3 | 2.92x | 2.28x |
+| 4 | 3.85x | 2.82x |
+| 5 | 4.77x | 3.31x |
+
+Consecutive tokens share their hot experts (already in VRAM) but almost never their cold ones, so every drafted token
+costs close to a full token of CPU-lane reads. Prompt-lookup drafting can only pay where drafts are nearly always right
+(verbatim rewrites), and only with a gate that stops drafting after misses.
+
 ## Files
 
-bench_dsv41.py (driver), A_default.*, B_dspark.*, C_prof.log (profile), D_trace.bin (routing), cache_sim.py/.out, verify_copy.py/.log.
+bench_dsv41.py (driver), A_default.*, B_dspark.*, C_prof.log (profile), D_trace.bin (routing), cache_sim.py/.out, window_union.py, screen.sh, verify_copy.py/.log.
