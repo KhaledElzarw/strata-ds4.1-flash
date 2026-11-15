@@ -83,13 +83,14 @@ def main():
             log.write("=== round %d %s prompt %d\n" % (rnd, name, len(ids))); log.flush()
             p.stdin.write("GEN %d %s\n" % (mx, ",".join(map(str, ids))))
             p.stdin.flush()
-            gen, done = 0, None
+            gen, done, ids_out = 0, None, []
             while True:
                 line = p.stdout.readline()
                 if not line:
                     break
                 if line.startswith("T "):
                     gen += 1
+                    ids_out.append(int(line.split()[-1]))
                 elif line.startswith("DONE"):
                     done = line.split()
                     break
@@ -101,7 +102,7 @@ def main():
             pms, dms = float(done[3]), float(done[4])
             r = {"round": rnd, "id": name, "prompt_tokens": len(ids), "gen": gen, "prompt_ms": pms, "decode_ms": dms,
                  "decode_tps": gen * 1000.0 / dms if dms > 0 else 0.0, "prompt_tps": len(ids) * 1000.0 / pms if pms > 0 else 0.0,
-                 "done": " ".join(done)}
+                 "done": " ".join(done), "ids": ids_out}
             rows.append(r)
             print("r%d %-14s prompt %6d (%7.1f tok/s)  gen %3d  decode %6.2f tok/s" % (
                 rnd, name, len(ids), r["prompt_tps"], gen, r["decode_tps"]), flush=True)
