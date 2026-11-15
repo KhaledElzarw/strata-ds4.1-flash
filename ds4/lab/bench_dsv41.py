@@ -44,6 +44,23 @@ def prompts():
     ]
 
 
+def long_items(tok, sizes):
+    """Long-context prompts: this repo's own engine sources (sorted, deterministic) cut to each size in tokens, then one
+    question.  Every size starts with the same tokens, so a longer prompt after a shorter one reuses its prefix."""
+    files = sorted(p for p in (TOOLS.parents[1] / "src").rglob("*") if p.suffix in (".cu", ".cpp", ".hpp", ".h", ".cuh"))
+    body = []
+    for p in files:
+        body += tok.encode("\n// ---- %s\n" % p.relative_to(TOOLS.parents[1]).as_posix() + read(p), parse_special=False)
+        if len(body) >= max(sizes):
+            break
+    head = tok.encode(BOS + USER + "Below are source files of an LLM inference engine.\n\n", parse_special=True)
+    tail = tok.encode("\n\nName the five longest functions in the files above and say in one sentence each what they do."
+                      + ASSIST, parse_special=True)
+    if len(body) < max(sizes):
+        raise SystemExit("only %d tokens of sources for a %d-token prompt" % (len(body), max(sizes)))
+    return [("long_%dk" % (n // 1000), head + body[:n - len(head) - len(tail)] + tail) for n in sizes]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--exe", required=True)
@@ -51,6 +68,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--rounds", type=int, default=2)
     ap.add_argument("--max-tokens", type=int, default=384)
+    ap.add_argument("--long", default="", help="long-context prompts instead of the 7: sizes in tokens, e.g. 100000,200000")
     argv = sys.argv[1:]
     cut = argv.index("--") if "--" in argv else len(argv)
     a = ap.parse_args(argv[:cut])
@@ -58,7 +76,10 @@ def main():
 
     import smoke
     tok = smoke.tokenizer(Path(a.pack))
-    items = [(name, tok.encode(BOS + USER + text + ASSIST, parse_special=True)) for name, text in prompts()]
+    if a.long:
+        items = long_items(tok, [int(x) for x in a.long.split(",")])
+    else:
+        items = [(name, tok.encode(BOS + USER + text + ASSIST, parse_special=True)) for name, text in prompts()]
     out = Path(a.out)
     log = open(out.with_suffix(".log"), "w", encoding="utf-8", errors="replace")
     cmd = [a.exe, "--pack", a.pack, *extra, "--serve"]
@@ -79,7 +100,7 @@ def main():
     rows = []
     for rnd in range(1, a.rounds + 1):
         for name, ids in items:
-            mx = 256 if name == "long_summary" else a.max_tokens
+            mx = 256 if name == "long_summary" or name.startswith("long_") else a.max_tokens
             log.write("=== round %d %s prompt %d\n" % (rnd, name, len(ids))); log.flush()
             p.stdin.write("GEN %d %s\n" % (mx, ",".join(map(str, ids))))
             p.stdin.flush()
@@ -100,8 +121,10 @@ def main():
             # DONE <produced> <prompt tokens> <prompt ms> <decode ms> <finish> ...
             gen = int(done[1]) if done[1].lstrip("-").isdigit() else gen
             pms, dms = float(done[3]), float(done[4])
-            r = {"round": rnd, "id": name, "prompt_tokens": len(ids), "gen": gen, "prompt_ms": pms, "decode_ms": dms,
-                 "decode_tps": gen * 1000.0 / dms if dms > 0 else 0.0, "prompt_tps": len(ids) * 1000.0 / pms if pms > 0 else 0.0,
+            reused = int(done[8]) if len(done) > 8 and done[8].isdigit() else 0   # (prompt tokens kept from the last request)
+            r = {"round": rnd, "id": name, "prompt_tokens": len(ids), "reused": reused, "gen": gen, "prompt_ms": pms,
+                 "decode_ms": dms, "decode_tps": gen * 1000.0 / dms if dms > 0 else 0.0,
+                 "prompt_tps": (len(ids) - reused) * 1000.0 / pms if pms > 0 else 0.0,
                  "done": " ".join(done), "ids": ids_out}
             rows.append(r)
             print("r%d %-14s prompt %6d (%7.1f tok/s)  gen %3d  decode %6.2f tok/s" % (
