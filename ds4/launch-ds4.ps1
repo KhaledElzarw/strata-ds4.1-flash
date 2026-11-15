@@ -40,6 +40,9 @@ $cfg = [ordered]@{
     lib_dirs = @("C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin")
     port = $Port
     engine_ready_s = 3600
+    # split-KV decode attention: +3.6% real agent turns at 256K, +5-6% at 100K/200K-token prompts on this 3090, last-place
+    # rounding only (ds4\lab\RESULTS.md).  The config's env beats the shell's, so a shell DS4_ATTN_SPLIT=0 is passed on here.
+    env = @{ DS4_ATTN_SPLIT = $(if ($env:DS4_ATTN_SPLIT) { $env:DS4_ATTN_SPLIT } else { "1" }) }
 }
 $cfg | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 $run
 

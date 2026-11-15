@@ -99,6 +99,24 @@ The stock engine disagrees with itself across placements as much as attnsplit di
 [-0.0010, +0.0038], PPL x1.0014; stock-vs-stock differences reach +0.0049.  Verdict: rounding-level, inside the
 engine's own noise: PASS.
 
+## Long prompts (longab.sh, 2026-11-15 17:50-19:13)
+
+The 100K- and 200K-token prompts (this repo's sources, then one question; 256 tokens generated, greedy) at
+`--max-context 262144`, and the 100K one at 131072.  One load per arm, arms in ABCCBA order, two rounds a load, no
+expert profile; no other program on the GPU (pmon).  Paired geo-mean of decode tok/s over matching (load, round, prompt):
+
+| Context | Prompt | base | iq1s | attnsplit | attnsplit vs iq1s | attnsplit vs base |
+|---|---|---|---|---|---|---|
+| 262144 | 100K | 21.91 | 22.67 | 23.94 median | +5.1% over both prompts, 8 of 8 pairs faster (+2.1 to +9.7%) | +7.3%, 8 of 8 |
+| 262144 | 200K | 23.45 | 23.79 | 25.25 | | |
+| 131072 | 100K | 23.19 | 23.47 | 24.89 | +6.1%, 4 of 4 (+3.1 to +9.1%) | +7.0%, 4 of 4 |
+
+Prompt reading is ~985 tok/s for every arm (100K in ~102 s, 200K in ~203 s): the split serves decode only, and iq1s,
+which halved the short prompts of agent turns, does not change a prompt this long.  At 131072 the second round reused
+the whole 100K prefix (99,999 tokens kept), so its prompt figure is not a read speed.  The gain at 200K tokens of
+context shows the split still runs there (it falls back to the scalar kernel above its row cap).  Adopted: `launch-ds4.ps1` sets DS4_ATTN_SPLIT=1 (a shell
+DS4_ATTN_SPLIT=0 still turns it off); checked by starting the server through it and reading the engine's environment.
+
 ## Files
 
 bench_dsv41.py (driver), qcheck.sh (quality), idcheck.sh (identity), longab.sh (long prompts), ab.py/ab_clean.py (A/B), A_default.*, B_dspark.*, C_prof.log (profile), D_trace.bin (routing), cache_sim.py/.out, window_union.py, screen.sh, verify_copy.py/.log.
