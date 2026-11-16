@@ -1225,6 +1225,16 @@ struct Model::Impl {
     std::vector<std::vector<os::Core>> core_threads;   // ... each with its logical CPUs and efficiency class
     std::string lane_name = "cores";            // the CPU lane's pools: which of lane_cfgs() (tune_lane picks one)
     std::string lane_report;                    // what tune_lane measured
+    // the CPU lane's rows a job (IQ experts): DS4_LANE_RB=N, 64 by default (lane bench, 9950X, one token: 49-54 GB/s
+    // from two experts a call at 32-256 rows; one expert 39 GB/s at 64, 46 at 32 - but those calls are 6% of the
+    // lane's and 1.8% of its time, and 32 rows for them measured no faster on the prompts)
+    int lane_rb = [] {
+        const char* v = std::getenv("DS4_LANE_RB");
+        const int n = v != nullptr ? std::atoi(v) : 64;
+        return n >= 8 && n <= 4096 ? n : 64;
+    }();
+    bool lane_ph_on = false;                    // (lane_bench: cpu_experts_iq sums its phases into lane_ph)
+    double lane_ph[4] = {};
     int NH = 1;                                 // the CPU lane's parts of an expert (the NUMA nodes)
     // the CPU lane's experts read in place from the model's files (one part, the files' layout; the page cache keeps
     // what fits) instead of copied into RAM, and how much of them the load reads ahead (the most-routed first)
@@ -3754,7 +3764,7 @@ struct Model::Impl {
             ahead_fl.assign(L.size() * 1024, 0);
             ahead_rank.assign(L.size() * 1024, 0);
             ahead_for.assign(L.size(), 0);
-            const int core = !cores.empty() && !cores[0].empty() ? cores[0][0] : -1;
+            const int core = svc_cpu();
             service = std::thread([this, core] {
                 if (core >= 0) pin_self(core);
                 serve_lane();
@@ -3792,6 +3802,7 @@ struct Model::Impl {
         one_gpu_plan();   // (#496: the one-GPU path kept only where something streams)
         init_store();      // (last: the store's arena is registered with the driver - page-locked memory the other pinned allocations must come before)
         preload_store();
+        lane_bench();   // (DS4_LANE_BENCH=1 only: prints the lane's speed by setting)
         // On by default for a Windows HIP build on an APU (Strix Halo: measured +7.5% decode, no change in the prompt); DS4_NO_VIEW=1 forces it
         // on anywhere, DS4_NO_VIEW=0 turns it off
         bool no_view = std::getenv("DS4_NO_VIEW") != nullptr && std::atoi(std::getenv("DS4_NO_VIEW")) != 0;
@@ -6780,26 +6791,91 @@ struct Model::Impl {
         std::vector<std::vector<int>> cpus;
         bool measured = true;   // (tune_lane times it; false: by hand only)
     };
-    std::vector<LaneCfg> lane_cfgs() const {
+    // the CPU the lane's service thread is pinned to (it runs a layer's activation quantize and helps pool 0, whose
+    // workers leave it out): node 0's first core; when that is CPU 0, as DS4_LANE_CPU0 says (skip: the last core of the
+    // fastest class in node 0's share of the lane's first part, sib: CPU 0's sibling); or DS4_SVC_CPU=N (a logical CPU of
+    // node 0's cores)
+    int svc_cpu() const {
+        if (cores.empty() || cores[0].empty()) return -1;
+        static const int want = std::getenv("DS4_SVC_CPU") ? std::atoi(std::getenv("DS4_SVC_CPU")) : -1;
+        if (want >= 0)
+            for (int c : cores[0])
+                if (c == want) return c;
+        const int m0 = lane_cpu0_mode();
+        if (cores[0][0] == 0 && m0 == 1)   // (sib: core 0's second CPU)
+            for (const auto& p : core_threads)
+                for (const os::Core& co : p)
+                    if (!co.cpus.empty() && co.cpus[0] == 0 && co.cpus.size() > 1) return co.cpus[1];
+        if (cores[0][0] == 0 && m0 == 2 && !core_threads.empty()) {
+            // (in part 0, where pools_for leaves it out - DS4_COPY_NUMA=2 splits one node - and not an E-core)
+            std::vector<os::Core> c0 = lane_parts()[0];
+            if (c0.size() > core_threads[0].size()) c0 = core_threads[0];   // (one pool over every node: node 0's)
+            int top = 0, pick = -1;
+            for (const os::Core& co : c0) top = std::max(top, co.eff);
+            for (const os::Core& co : c0)
+                if (co.eff == top && !co.cpus.empty() && co.cpus[0] != 0) pick = co.cpus[0];
+            if (pick >= 0 && c0.size() > 1) return pick;
+        }
+        return cores[0][0];
+    }
+    // logical CPU 0 in a lane configuration as DS4_LANE_CPU0 says: the CPU to use for core `co`'s k-th one, or -1 for none
+    // (skip, in a part of more than one core)
+    static int lane_cpu(const os::Core& co, size_t k, size_t part_cores, int m0) {
+        const int cpu = co.cpus[k];
+        if (cpu != 0) return cpu;
+        if (m0 == 1 && co.cpus.size() > 1) return co.cpus[1];   // (sib: its sibling)
+        if (m0 == 2 && part_cores > 1) return -1;               // (skip)
+        return cpu;
+    }
+    // the lane's parts (one a NUMA node; DS4_COPY_NUMA=2 on one node, a test: its cores split in NH; experts in place over
+    // several nodes: one part of every node's cores), each a list of cores
+    std::vector<std::vector<os::Core>> lane_parts() const {
         std::vector<std::vector<os::Core>> parts = core_threads;
-        if ((int) parts.size() < NH && !parts.empty()) {   // (DS4_COPY_NUMA=2 on one node, a test: its cores split in NH)
+        if ((int) parts.size() < NH && !parts.empty()) {
             std::vector<os::Core> all = parts[0];
             parts.assign((size_t) NH, {});
             for (size_t i = 0; i < all.size(); ++i) parts[i * (size_t) NH / all.size()].push_back(all[i]);
         }
-        const bool one_over_all = file_experts && NH == 1 && parts.size() > 1;
-        if (one_over_all)
+        if (lane_one_over_all())
             for (size_t Y = 1; Y < parts.size(); ++Y) parts[0].insert(parts[0].end(), parts[Y].begin(), parts[Y].end());
         parts.resize((size_t) std::max(1, std::min((int) parts.size(), std::max(NH, 1))));
+        return parts;
+    }
+    bool lane_one_over_all() const { return file_experts && NH == 1 && core_threads.size() > 1; }
+    // DS4_LANE_CPU0: where the lane stands on logical CPU 0, which takes most of Windows' DPCs and interrupts while the GPU
+    // decodes (9950X + 3090: 36-38% DPC + 13% interrupt time on CPU 0 in decode, ~0 on the others).  skip (the default on
+    // Windows): core 0 left out of the lane, the service thread on node 0's last core (15 threads; +9.5% decode at 256K,
+    // A/B r7); sib: core 0's slot and the service thread on its SMT sibling, CPU 1 (+8.7%); keep (the default elsewhere):
+    // CPU 0 in the lane, the service thread on it
+    static int lane_cpu0_mode() {
+        static const int m = [] {
+            const char* e = std::getenv("DS4_LANE_CPU0");
+#ifdef _WIN32
+            if (e == nullptr) return 2;
+#else
+            if (e == nullptr) return 0;
+#endif
+            const std::string v = e;
+            return v == "sib" ? 1 : v == "skip" ? 2 : 0;
+        }();
+        return m;
+    }
+    std::vector<LaneCfg> lane_cfgs() const {
+        const std::vector<std::vector<os::Core>> parts = lane_parts();
+        const bool one_over_all = lane_one_over_all();
         // a configuration from each part's cores that `keep` takes: their first CPUs, then (smt) their second ones, ..
         auto make = [&](const std::string& name, bool smt, const std::function<bool(const os::Core&)>& keep) {
             LaneCfg c;
             c.name = name;
+            const int m0 = smt ? 0 : lane_cpu0_mode();
             for (const auto& p : parts) {
                 std::vector<int> v;
                 for (size_t k = 0; k < (smt ? 4u : 1u); ++k)
                     for (const os::Core& co : p)
-                        if (keep(co) && k < co.cpus.size()) v.push_back(co.cpus[k]);
+                        if (keep(co) && k < co.cpus.size()) {
+                            const int cpu = lane_cpu(co, k, p.size(), m0);
+                            if (cpu >= 0) v.push_back(cpu);
+                        }
                 c.cpus.push_back(v);
             }
             return c;
@@ -6823,14 +6899,18 @@ struct Model::Impl {
             LaneCfg c;
             c.name = "node";
             c.cpus.emplace_back();
-            for (const os::Core& co : core_threads[0]) c.cpus[0].push_back(co.cpus[0]);
+            const int m0 = lane_cpu0_mode();
+            for (const os::Core& co : core_threads[0]) {
+                const int cpu = lane_cpu(co, 0, core_threads[0].size(), m0);
+                if (cpu >= 0) c.cpus[0].push_back(cpu);
+            }
             out.push_back(c);
         }
         return out;
     }
     std::vector<std::unique_ptr<Pool>> pools_for(const LaneCfg& c) const {
         std::vector<std::unique_ptr<Pool>> out;
-        const int svc = !cores.empty() && !cores[0].empty() ? cores[0][0] : -1;
+        const int svc = svc_cpu();
         for (size_t X = 0; X < c.cpus.size(); ++X) {
             std::vector<int> v = c.cpus[X];
             if (X == 0) v.erase(std::remove(v.begin(), v.end(), svc), v.end());   // (the service thread's)
@@ -6870,8 +6950,8 @@ struct Model::Impl {
         if (o.verbose) {
             int nthr = 0;
             for (auto& p : pools) nthr += p->size();
-            std::fprintf(stderr, "ds4: CPU lane: %d threads, MXFP4 rows %s (%s)\n", nthr, gg::mx_tier_name(gg::mx_tier()),
-                         gg::mx_tier_report());
+            std::fprintf(stderr, "ds4: CPU lane: %d threads, the service thread on CPU %d, MXFP4 rows %s (%s)\n", nthr, svc_cpu(),
+                         gg::mx_tier_name(gg::mx_tier()), gg::mx_tier_report());
         }
     }
     // The CPU lane's configuration measured on this host, once its experts are placed: each of lane_cfgs() times the
@@ -6922,7 +7002,7 @@ struct Model::Impl {
         for (size_t i = 0; i < cfgs.size(); ++i)
             if (i != cur) cand[i] = pools_for(cfgs[i]);
         std::vector<double> best(cfgs.size(), 1e30);
-        const int svc = !cores.empty() && !cores[0].empty() ? cores[0][0] : -1;
+        const int svc = svc_cpu();
         std::thread th([&] {
             if (svc >= 0) pin_self(svc);
             size_t set = 0;
@@ -6968,6 +7048,124 @@ struct Model::Impl {
         cand.clear();   // (the others' workers stopped)
         std::fprintf(stderr, "ds4: CPU lane: %s, %d threads (measured, %d experts of one token a call: %s)\n",
                      lane_name.c_str(), cpu_threads(), kPer, lane_report.c_str());
+    }
+
+    // DS4_LANE_BENCH=1: the CPU lane's speed by experts a call (one token) and rows a job, once the store is filled -
+    // calls on one layer's CPU-lane experts that are in RAM, cycling through up to 64 of them (more than the CPU's
+    // caches hold), on the service thread's CPU, the workers kept spinning as in decode; each setting's median of 12
+    // calls, the best of 5 interleaved rounds, and its phases (prep, gate+up, h quant, down).  Prints only: the rows
+    // a job are put back as they were.
+    void lane_bench() {
+        if (std::getenv("DS4_LANE_BENCH") == nullptr || pools.empty()) return;
+        int il = -1, most = 0;
+        for (int i = 0; i < g.nl; ++i) {
+            int n = 0;
+            for (int e = 0; e < L[(size_t) i].n_exp; ++e)
+                n += L[(size_t) i].slot[(size_t) e] < 0 && (!store || store->find(i, e) >= 0);
+            if (n > most) most = n, il = i;
+        }
+        if (il < 0 || most < 32) {
+            std::fprintf(stderr, "ds4: lane bench: too few CPU-lane experts in RAM (%d)\n", most);
+            return;
+        }
+        const Layer& l = L[(size_t) il];
+        if (!(l.lay.fmt == gg::kFmtMXFP4 && !gg::mx_experts(l.lay))) {
+            std::fprintf(stderr, "ds4: lane bench: layer %d is not an i-quant layer\n", il);
+            return;
+        }
+        std::vector<int> es;
+        for (int e = 0; e < l.n_exp && (int) es.size() < 64; ++e)
+            if (l.slot[(size_t) e] < 0 && (!store || store->find(il, e) >= 0)) es.push_back(e);
+        if (es.size() < 32) {   // (DS4_STORE_BG=1: the background preload may have moved them since the count above)
+            std::fprintf(stderr, "ds4: lane bench: too few CPU-lane experts in RAM (%zu)\n", es.size());
+            return;
+        }
+        const size_t eb = mx_part_bytes(l, 0) + mx_part_bytes(l, 1) + mx_part_bytes(l, 2);
+        std::vector<float> x((size_t) g.dim);
+        for (size_t i = 0; i < x.size(); ++i) x[i] = 0.02f * std::sin(0.37f * (float) i);
+        {   // the mailbox's memory as the CPU sees it (the decode's first quantize reads reqs' x, the answer goes into resps'
+            // part): us a call, median of 41 - each from a local buffer and from the mailbox's unused last slot
+            gg::IqCpu fm;
+            std::string ferr;
+            if (reqs != nullptr && resps != nullptr &&
+                gg::iq_cpu_fmt(gg::expert_type(l.lay, 0), gg::expert_type(l.lay, 2), g.dim, g.ff, fm, ferr)) {
+                Req& rq = reqs[kRing - 1];
+                Resp& rs = resps[kRing - 1];
+                std::memcpy(rq.x[0], x.data(), (size_t) g.dim * sizeof(float));
+                std::vector<uint8_t> q((size_t) g.dim * 4 + 64);
+                std::vector<float> loc((size_t) g.dim + 16);
+                float* lo = (float*) (((uintptr_t) loc.data() + 63) & ~(uintptr_t) 63);
+                const size_t xb = (size_t) g.dim * sizeof(float);
+                auto med = [&](const std::function<void()>& fn) {
+                    std::array<double, 41> t{};
+                    for (double& v : t) {
+                        const double a = now_ms();
+                        fn();
+                        v = (now_ms() - a) * 1000.0;
+                    }
+                    std::sort(t.begin(), t.end());
+                    return t[20];
+                };
+                const double q_loc = med([&] { gg::iq_cpu_quant(fm.gu_act, x.data(), g.dim, q.data()); });
+                const double q_mb = med([&] { gg::iq_cpu_quant(fm.gu_act, rq.x[0], g.dim, q.data()); });
+                const double c_mb = med([&] { std::memcpy(lo, rq.x[0], xb); });
+                const double s_mb = med([&] { os::stream_copy(lo, rq.x[0], xb); });
+                const double c_loc = med([&] { std::memcpy(lo, x.data(), xb); });
+                const double w_mb = med([&] { std::memcpy(rs.part[0], lo, xb); });
+                std::fprintf(stderr, "ds4: lane bench: mailbox (%zu KB, x %s16-aligned): quantize local %.1f us, from reqs %.1f; copy from reqs %.1f "
+                             "(streaming loads %.1f), local %.1f; copy into resps %.1f\n", xb / 1024,
+                             ((uintptr_t) rq.x[0] & 15) == 0 ? "" : "not ", q_loc, q_mb, c_mb, s_mb, c_loc, w_mb);
+            }
+        }
+        struct Set { int k, rb; double best = 1e30, ph[4] = {}; int nph = 0; };
+        std::vector<Set> cfg;
+        for (int k : {1, 2, 4, 6, 8, 16})
+            for (int rb : {32, 64, 128, 256}) cfg.push_back({k, rb});
+        const int rb0 = lane_rb;
+        const int svc = svc_cpu();
+        size_t next = 0;
+        auto call = [&](int k) {
+            std::vector<Ent> ents((size_t) k);
+            for (int i = 0; i < k; ++i) {
+                ents[(size_t) i].e = es[next++ % es.size()];
+                ents[(size_t) i].n = 1;
+                ents[(size_t) i].slot0 = i;
+                ents[(size_t) i].tok[0] = 0;
+            }
+            cpu_experts(l, x.data(), ents, (size_t) g.dim);
+        };
+        std::thread th([&] {
+            if (svc >= 0) pin_self(svc);
+            for (size_t i = 0; i < es.size(); ++i) call(1);   // (every expert's pages touched once)
+            constexpr int kRounds = 5, kCalls = 12;
+            for (int r = 0; r < kRounds; ++r)
+                for (size_t j = 0; j < cfg.size(); ++j) {
+                    Set& c = cfg[(j + (size_t) r * 7) % cfg.size()];
+                    lane_rb = c.rb;
+                    for (const double t0 = now_ms(); now_ms() - t0 < 10;) call(c.k);   // (warm: workers spinning)
+                    std::array<double, kCalls> t{};
+                    for (double& v : lane_ph) v = 0;
+                    lane_ph_on = true;
+                    for (int q = 0; q < kCalls; ++q) {
+                        const double a = now_ms();
+                        call(c.k);
+                        t[(size_t) q] = now_ms() - a;
+                    }
+                    lane_ph_on = false;
+                    for (int p = 0; p < 4; ++p) c.ph[p] += lane_ph[p];
+                    c.nph += kCalls;
+                    std::sort(t.begin(), t.end());
+                    c.best = std::min(c.best, 0.5 * (t[kCalls / 2 - 1] + t[kCalls / 2]));
+                }
+        });
+        th.join();
+        lane_rb = rb0;
+        std::fprintf(stderr, "ds4: lane bench: layer %d, %zu experts of %.2f MB, %d threads (%s)\n", il, es.size(),
+                     (double) eb / 1e6, cpu_threads(), lane_name.c_str());
+        for (const Set& c : cfg)
+            std::fprintf(stderr, "ds4: lane bench: k %2d rb %3d  %.3f ms  %5.1f GB/s  phases (mean ms) prep %.3f gate+up %.3f hq %.3f down %.3f\n",
+                         c.k, c.rb, c.best, (double) c.k * (double) eb / (c.best * 1e6), c.ph[0] / c.nph, c.ph[1] / c.nph,
+                         c.ph[2] / c.nph, c.ph[3] / c.nph);
     }
 
     // ---- --parallel: several conversations (Options::seqs), each its own rings, partial groups and KV
@@ -8179,9 +8377,10 @@ struct Model::Impl {
     }
 #endif
     void cpu_experts_iq(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord) {
-        constexpr int RB = 64;   // rows a job
+        const int ne = (int) ents.size();
+        const int RB = lane_rb;   // rows a job (any count: every row is its own sum)
         const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH;
-        const int GB = (FFh + RB - 1) / RB, DB = (Eh + RB - 1) / RB, ne = (int) ents.size();
+        const int GB = (FFh + RB - 1) / RB, DB = (Eh + RB - 1) / RB;
         gg::IqCpu fm;
         std::string ferr;
         if (!gg::iq_cpu_fmt(gg::expert_type(l.lay, 0), gg::expert_type(l.lay, 2), E, FF, fm, ferr) ||
@@ -8193,8 +8392,8 @@ struct Model::Impl {
             std::fflush(stderr);
             std::abort();
         }
-        static double t_pre = 0, t_q1 = 0, t_r1 = 0, t_q2 = 0, t_r2 = 0; static long n_calls = 0; static bool reg = false;
-        if (ds4_dbg("DS4_CPU_LOG") && !reg) { reg = true; std::atexit([] { std::fprintf(stderr, "cpu_experts_iq phases (ms over %ld calls): prefetch %.1f, quant1 %.1f, gate_up %.1f, quant2 %.1f, down %.1f\n", n_calls, t_pre, t_q1, t_r1, t_q2, t_r2); }); }
+        static double t_pre = 0, t_q1 = 0, t_r1 = 0, t_q2 = 0, t_r2 = 0, t_tx = 0; static long n_calls = 0; static bool reg = false;
+        if (ds4_dbg("DS4_CPU_LOG") && !reg) { reg = true; std::atexit([] { std::fprintf(stderr, "cpu_experts_iq phases (ms over %ld calls): prefetch %.1f, quant1 %.1f (of it the input's first read %.1f), gate_up %.1f, quant2 %.1f, down %.1f\n", n_calls, t_pre, t_q1, t_tx, t_r1, t_q2, t_r2); }); }
         const bool cpulog = ds4_dbg("DS4_CPU_LOG");   // (the Mac engine's counters; false elsewhere)
         if (cpulog) ++n_calls;
         double tp0 = now_ms();
@@ -8245,6 +8444,22 @@ struct Model::Impl {
             const int t = en.tok[i];
             return aq + (size_t) (t < kWin ? t : kWin + en.slot0 + i) * E * 4;
         };
+        {   // DS4_X_TOUCH=1 (DS4_CPU_LOG's test): one float a line of the inputs read first, timed alone
+            static const bool xtouch = std::getenv("DS4_X_TOUCH") != nullptr && std::atoi(std::getenv("DS4_X_TOUCH")) != 0;
+            if (xtouch && cpulog) {
+                const double a = now_ms();
+                volatile float sink = 0.0f;
+                float acc = 0.0f;
+                for (const Ent& en : ents)
+                    for (int i = 0; i < en.n; ++i) {
+                        const float* xp = x + (size_t) en.tok[i] * ldx;
+                        for (int k = 0; k < E; k += 16) acc += xp[k];
+                    }
+                sink = acc;
+                (void) sink;
+                t_tx += now_ms() - a;
+            }
+        }
         {
             bool done[kWin] = {};
             for (const Ent& en : ents)
@@ -8304,12 +8519,24 @@ struct Model::Impl {
             };
         run_nodes(ne * DB, f);
         if (cpulog) t_r2 += now_ms() - tq2;
+        if (lane_ph_on) {   // (lane_bench's phase sums)
+            const double te = now_ms();
+            lane_ph[0] += tq1 - tp0; lane_ph[1] += tr1 - tq1; lane_ph[2] += tq2 - tr1; lane_ph[3] += te - tq2;
+        }
         {   // DS4_PROF: where the CPU lane's time goes (act prep + prefetch, gate/up, h quant, down), summed
             static const bool on = std::getenv("DS4_PROF") != nullptr;
             if (on) {
                 static double acc[6] = {};
+                static long hist[5] = {};   // (calls of 1, 2, 3-4, 5-8, 9+ entries, and their time in hist_ms)
+                static double hist_ms[5] = {};
                 const double te = now_ms();
                 acc[0] += tq1 - tp0; acc[1] += tr1 - tq1; acc[2] += tq2 - tr1; acc[3] += te - tq2; acc[4] += 1; acc[5] += ne;
+                const int hb = ne <= 1 ? 0 : ne == 2 ? 1 : ne <= 4 ? 2 : ne <= 8 ? 3 : 4;
+                hist[hb]++;
+                hist_ms[hb] += te - tp0;
+                if (((long long) acc[4]) % 1000 == 0)
+                    std::fprintf(stderr, "ds4 prof CPU lane calls by entries: 1: %ld (%.0f ms), 2: %ld (%.0f ms), 3-4: %ld (%.0f ms), 5-8: %ld (%.0f ms), 9+: %ld (%.0f ms)\n",
+                                 hist[0], hist_ms[0], hist[1], hist_ms[1], hist[2], hist_ms[2], hist[3], hist_ms[3], hist[4], hist_ms[4]);
                 if (((long long) acc[4]) % 1000 == 0)
                     std::fprintf(stderr, "ds4 prof CPU lane (IQ rows) per call: n %.0f, entries/call %.2f, prep %.3f ms, gate+up %.3f ms, h-quant %.3f ms, down %.3f ms\n", acc[4], acc[5] / acc[4], acc[0] / acc[4], acc[1] / acc[4], acc[2] / acc[4], acc[3] / acc[4]);
             }

@@ -212,6 +212,75 @@ identity vs the previous exe 7/7 (idcheck b7).  Real turns at 256K, fixed `--ssd
 
 Prompt time unchanged (paired 0.98x [0.94, 1.02]).  Adopted.
 
+## The CPU lane's speed, measured in place (lanebench.sh, 2026-11-16 03:00-03:50)
+
+`DS4_LANE_BENCH=1` times the lane at load once the store is filled: one layer's CPU-lane experts that are in RAM
+(64 of them, cycled, so the weights come from DRAM), one token, the workers spinning as in decode, best of 5 interleaved
+rounds.  GB/s of expert weights (6.91 MB an expert):
+
+| experts a call | rows a job 32 | 64 (default) | 128 | 256 |
+|---|---|---|---|---|
+| 1 | 46.1 | 39.2 | 36.6 | 25.0 |
+| 2 | 48.9 | 48.7 | 41.6 | 37.7 |
+| 4 | 50.6 | 52.3 | 49.9 | 42.0 |
+| 8 | 50.7 | 52.4 | 53.5 | 51.5 |
+| 16 | 49.3 | 52.9 | 53.8 | 54.5 |
+
+From two experts a call the lane runs at the rows' own speed; gate+up and down (IQ1_S, IQ1_M) both ~53 GB/s.  A plain
+16-thread AVX-512 read of 4 GB on this PC: 64.8 GB/s (61.3 on 8 threads, 65.5 on 15, 62.7 on 32), so the lane is at 82%
+of the DRAM read limit.  (tune_lane's 0.93 ms for 4 experts, ~31 GB/s, is file-backed experts and sleeping workers, not
+decode.)  DS4_PROF's call histogram (64K bench prompts, 10,000 lane calls, 3.96 experts a call): one expert 6% of the
+calls and 1.8% of the lane's time, so 32 rows for them measured no faster (token identity 7/7, per-prompt speed within
+1%): the default stays 64 (`DS4_LANE_RB=N` sets it).  The CPU and PCIe lanes together are capped near the same 65 GB/s
+(the GPU's copies read the same DRAM), so the opt-in DS4_STORE_ZC split could save at most ~18% of the lane's time
+before its staging copy's latency.
+
+## Where a token goes now, again (tp.sh tp2, 2026-11-16 03:55-03:57)
+
+After the store's 6 GB headroom, size classes and the #7 batch (b74f5c0a), same prompt and settings as tp1 (256K,
+frozen profile, ~300 greedy tokens in CLI mode), ms a token:
+
+| GPU (DS4_PROF) | tp1 | tp2 |
+|---|---|---|
+| a token | 46.5 | 33.5 |
+| waiting for the CPU lane | 27.4 | 15.2 |
+| attention | 10.6 | 10.1 |
+| routing + shared expert, VRAM experts, down + post | 8.5 | 8.1 |
+
+Host timers (DS4_DIAG build): the store holds 13,230 of the 13,301 lane experts (99.6% of the lane's 88 experts a
+token hit RAM, 0.6 ms a token of SSD waits, was 8.8); the lane's phases a token: gate+up 10.6, down 5.7, first
+activation quantize 0.71, second 0.18 ms.  The first quantize takes 20 us a call in decode against ~4 us in the bench
+(5.8 us when it reads the mailbox's x, which the GPU has just written over PCIe); the cause is in the next section.
+
+## The lane off logical CPU 0 (A/B r7, 2026-11-16 04:40-06:10)
+
+Not the PCIe read: prefetching the input (DS4_X_PF) and touching one float a line first (DS4_X_TOUCH: 0.0 ms of the
+quantize's 180) changed nothing, nor did keeping the cores' 512-bit units busy between layers (DS4_VEC_WARM, Zen 5's
+vector warm-up); both knobs are gone.  The cause is where the service thread runs: in decode, Windows services the GPU
+driver's DPCs on logical CPU 0 (typeperf: 36-38% DPC + 13% interrupt time there, ~0 on every other CPU), and the
+service thread, which runs the quantize and pool 0's share of the rows, was pinned to CPU 0.  The engine sets no CUDA
+sync flags (one context: its waits spin), so these DPCs come from the driver's work submissions (~1,500 launches a
+token), not from blocking waits.
+
+`DS4_LANE_CPU0`: keep (CPU 0 in the lane, the service thread on it, as before), sib (core 0's slot and the service
+thread on its SMT sibling, CPU 1), skip (core 0 left out: 15 threads, the service thread on node 0's last core).  Both
+new layouts are exact (idcheck vs the previous exe: 7/7 each).  tp7 (256K, ~270 tokens): the first quantize 19.1 ->
+8.1 us a call (sib) and 8.2 (skip).  Real turns at 256K, 30 Hermes turns x 3 rounds, interleaved, `--ssd-cache 88`,
+frozen profile, ab_clean `--pmon 5`:
+
+| vs keep | per-round medians (tok/s) | clean pairs | all pairs |
+|---|---|---|---|
+| keep | 30.4, 29.6, 29.6 | | |
+| sib | 31.7, 32.0, 31.8 | +8.7% [6.8, 11.3] n64 | +8.1% [6.6, 10.1] n86 |
+| skip | 32.3, 33.1, 32.7 | +9.5% [7.4, 12.2] n69 | +9.6% [7.9, 11.8] n85 |
+
+skip vs sib: +1.3% [0.1, 2.5] n74 clean.  Prompt time unchanged (skip 0.96x [0.87, 1.02]).  Adopted: skip is the
+default on Windows (`DS4_LANE_CPU0=keep` or `sib` for the others; elsewhere keep stays the default, not measured there).
+The service thread's CPU is the last core of the fastest class in the lane's first part (so not an E-core on a hybrid
+CPU, and inside part 0 for DS4_COPY_NUMA=2's split); the verbose lane line prints it.  Code review (Codex, Gemini)
+found four edge-layout and diagnostic defects, all fixed before the commit; the reviewed exe is identical to the
+previous one on 7/7 prompts (skip and sib).
+
 ## Files
 
 bench_dsv41.py (driver), qcheck.sh (quality), idcheck.sh (identity), longab.sh (long prompts), ab.py/ab_clean.py (A/B), A_default.*, B_dspark.*, C_prof.log (profile), D_trace.bin (routing), cache_sim.py/.out, window_union.py, screen.sh, verify_copy.py/.log.

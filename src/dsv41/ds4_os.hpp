@@ -14,10 +14,14 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
+#if defined(__SSE4_1__) && !defined(_WIN32)
+#include <smmintrin.h>   // (_mm_stream_load_si128: stream_copy)
+#endif
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -26,6 +30,9 @@
 #endif
 #include <windows.h>
 #include <psapi.h>   // (K32QueryWorkingSetEx: kernel32's, no psapi.lib)
+#if defined(_M_X64) || defined(_M_IX86)
+#include <smmintrin.h>   // (_mm_stream_load_si128: stream_copy)
+#endif
 #include <timeapi.h>   // (timeBeginPeriod: windows.h with WIN32_LEAN_AND_MEAN does not bring it; winmm.lib below)
 #if defined(_MSC_VER)
 #pragma comment(lib, "winmm.lib")
@@ -495,6 +502,28 @@ inline void* huge_alloc(size_t bytes, size_t* got = nullptr) {
 #endif
 }
 
+/// n bytes from src to dst with streaming loads (MOVNTDQA: whole lines from write-combining memory, as fast as cached reads
+/// there; plain loads elsewhere); memcpy where src is not 16-byte aligned or the CPU is not x86
+inline void stream_copy(void* dst, const void* src, size_t n) {
+#if defined(_M_X64) || defined(__SSE4_1__)
+    if (((uintptr_t) src & 15) == 0 && ((uintptr_t) dst & 15) == 0) {
+        size_t o = 0;
+        for (; o + 64 <= n; o += 64) {
+            const __m128i a = _mm_stream_load_si128((__m128i*) ((const char*) src + o));
+            const __m128i b = _mm_stream_load_si128((__m128i*) ((const char*) src + o + 16));
+            const __m128i c = _mm_stream_load_si128((__m128i*) ((const char*) src + o + 32));
+            const __m128i d = _mm_stream_load_si128((__m128i*) ((const char*) src + o + 48));
+            _mm_store_si128((__m128i*) ((char*) dst + o), a);
+            _mm_store_si128((__m128i*) ((char*) dst + o + 16), b);
+            _mm_store_si128((__m128i*) ((char*) dst + o + 32), c);
+            _mm_store_si128((__m128i*) ((char*) dst + o + 48), d);
+        }
+        if (o < n) std::memcpy((char*) dst + o, (const char*) src + o, n - o);
+        return;
+    }
+#endif
+    std::memcpy(dst, src, n);
+}
 /// Anonymous memory on NUMA node `node` of `nodes` (node < 0 or nodes < 2: wherever the first touch puts it), on huge
 /// pages where the OS gives them; nullptr if it cannot be had.
 inline void* anon_alloc(size_t bytes, int node, int nodes) {
