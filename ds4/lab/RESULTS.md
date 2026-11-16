@@ -281,6 +281,17 @@ CPU, and inside part 0 for DS4_COPY_NUMA=2's split); the verbose lane line print
 found four edge-layout and diagnostic defects, all fixed before the commit; the reviewed exe is identical to the
 previous one on 7/7 prompts (skip and sib).
 
+Long prompts (longab.sh l128c / l256c, 1a3a5c20 vs b74f5c0a, the launcher's env: DS4_ATTN_SPLIT=1,
+DS4_STORE_HEADROOM_GB=6; 2 interleaved repeats x 2 rounds, 256 tokens each), decode median tok/s:
+
+| context | prompt | b74f5c0a | 1a3a5c20 | |
+|---|---|---|---|---|
+| 128K | 100K | 25.75 (24.32-27.47) | 29.08 (27.66-30.41) | +12.9% |
+| 256K | 100K | 25.40 (24.64-25.99) | 28.26 (27.86-28.87) | +11.3% |
+| 256K | 200K | 24.71 (20.40-26.30) | 28.59 (28.45-28.89) | +15.7% |
+
+Every run of the new layout is faster than every run of the old one; prompt reading unchanged (~990 tok/s).
+
 ## Files
 
 bench_dsv41.py (driver), qcheck.sh (quality), idcheck.sh (identity), longab.sh (long prompts), ab.py/ab_clean.py (A/B), A_default.*, B_dspark.*, C_prof.log (profile), D_trace.bin (routing), cache_sim.py/.out, window_union.py, screen.sh, verify_copy.py/.log.
